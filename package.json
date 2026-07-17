@@ -1,0 +1,221 @@
+{
+    "name": "smart-folding",
+    "displayName": "Smart Folding",
+    "description": "WebStorm-like code folding UX for VS Code: a bigger, highlighted, clickable '···' badge on folded blocks, single-line folds that hide the closing bracket, and parameter lists that stay visible when folding function bodies.",
+    "version": "1.0.0",
+    "publisher": "SeyMi",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "author": {
+        "name": "SeyMi"
+    },
+    "maintainers": [
+        "SeyMi"
+    ],
+    "categories": [
+        "Other"
+    ],
+    "icon": "images/icon.png",
+    "main": "./out/extension.js",
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "keywords": [
+        "folding",
+        "code folding",
+        "webstorm",
+        "intellij",
+        "single line fold",
+        "comment folding",
+        "click to expand",
+        "smart fold",
+        "smart unfold",
+        "cursor memory",
+        "focus mode",
+        "fold badge",
+        "code collapse",
+        "productivity"
+    ],
+    "contributes": {
+        "commands": [
+            {
+                "command": "smartFolding.expandHere",
+                "title": "Expand Folded Block on This Line",
+                "category": "Smart Folding"
+            },
+            {
+                "command": "smartFolding.foldAll",
+                "title": "Fold All (Remember Cursor)",
+                "category": "Smart Folding"
+            },
+            {
+                "command": "smartFolding.unfoldAll",
+                "title": "Unfold All (Restore Cursor & View)",
+                "category": "Smart Folding"
+            },
+            {
+                "command": "smartFolding.smartUnfold",
+                "title": "Smart Unfold — Expand Parents at Remembered Cursor",
+                "category": "Smart Folding"
+            },
+            {
+                "command": "smartFolding.smartUnfoldRecursively",
+                "title": "Smart Unfold Recursively — Expand Parents + Children at Remembered Cursor",
+                "category": "Smart Folding"
+            }
+        ],
+        "configuration": {
+            "title": "Smart Folding",
+            "properties": {
+                "smartFolding.enhancedEllipsis": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "Show a **bigger, highlighted `···` badge** at the end of every folded block (WebStorm style). Its background color comes from `#smartFolding.ellipsisBackground#` (default `#46494e`, the WebStorm badge color), giving a much larger visual target than VS Code's tiny ellipsis. Hovering it shows an **Expand** link, and with `#smartFolding.clickToExpand#` enabled, clicking next to it expands the block."
+                },
+                "smartFolding.ellipsisBackground": {
+                    "type": "string",
+                    "default": "#46494e",
+                    "markdownDescription": "Background color of the `···` badge shown on folded blocks. Accepts any CSS color (e.g. `#46494e`, `rgba(83, 127, 231, 0.35)`). Leave **empty** to use the theme's selection color (`editor.selectionBackground`) instead."
+                },
+                "smartFolding.ellipsisColor": {
+                    "type": "string",
+                    "default": "#9a9da5",
+                    "markdownDescription": "Text color of the `···` badge shown on folded blocks, for BOTH themes unless a theme-specific setting overrides it. Accepts any CSS color. Leave **empty** to use the theme's foreground color (`editor.foreground`) instead."
+                },
+                "smartFolding.ellipsisBackgroundDark": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "Background color of the `···` badge in **dark themes** (any CSS color, e.g. `#46494e`). Overrides `#smartFolding.ellipsisBackground#` when set; leave **empty** to fall back to it (and, if that is empty too, to the theme's `editor.selectionBackground`)."
+                },
+                "smartFolding.ellipsisBackgroundLight": {
+                    "type": "string",
+                    "default": "#dfe1e5",
+                    "markdownDescription": "Background color of the `···` badge in **light themes** (any CSS color, e.g. `#dfe1e5`, the IntelliJ Light chip color). Overrides `#smartFolding.ellipsisBackground#` when set; leave **empty** to fall back to it (and, if that is empty too, to the theme's `editor.selectionBackground`)."
+                },
+                "smartFolding.ellipsisColorDark": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "Text color of the `···` badge in **dark themes** (any CSS color). Overrides `#smartFolding.ellipsisColor#` when set; leave **empty** to fall back to it (and, if that is empty too, to the theme's `editor.foreground`)."
+                },
+                "smartFolding.ellipsisColorLight": {
+                    "type": "string",
+                    "default": "#6a6f77",
+                    "markdownDescription": "Text color of the `···` badge in **light themes** (any CSS color). Overrides `#smartFolding.ellipsisColor#` when set; leave **empty** to fall back to it (and, if that is empty too, to the theme's `editor.foreground`)."
+                },
+                "smartFolding.clickToExpand": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "Expand a folded block when you **click at the end of its first line** (i.e. on/next to the `···` badge). This emulates WebStorm's large clickable ellipsis — the VS Code API does not allow making a decoration itself clickable, so the whole area after the code on a folded line becomes the click target."
+                },
+                "smartFolding.modifierClickExpandsRecursively": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Modifier+click on a fold badge expands the block RECURSIVELY** (folded descendants included). The modifier is VS Code’s multi-cursor modifier — `Alt` by default; set `#editor.multiCursorModifier#` to `ctrlCmd` to use `Ctrl`/`Cmd`+click instead. (VS Code does not report other modifier combinations such as `Alt+Shift` on mouse clicks, so only the multi-cursor modifier can be detected.)"
+                },
+                "smartFolding.providerDelay": {
+                    "type": "number",
+                    "default": 2000,
+                    "markdownDescription": "Milliseconds to wait before re-registering this extension's folding provider. VS Code merges folding ranges from **all** providers and, on conflicts, the **most recently registered** provider wins — built-in language providers register lazily when a language loads, which can demote this extension's WebStorm-style ranges. The delayed re-registration keeps this provider the most recent. For a **guaranteed** WebStorm look, set `#editor.defaultFoldingRangeProvider#` to `seymi.smart-folding` instead — `#smartFolding.takeOverFolding#` (on by default) applies that automatically."
+                },
+                "smartFolding.takeOverFolding": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Guarantee the WebStorm look (recommended).** Sets `#editor.defaultFoldingRangeProvider#` to `seymi.smart-folding` (only when you haven't already pointed it at another provider yourself), making this extension the ONLY source of folding ranges for the configured languages. Without it, VS Code merges ranges from ALL providers and the built-in language provider can silently win, which makes folds look like plain VS Code again (closing bracket on its own line). Turning this off clears the setting again if it points at this extension."
+                },
+                "smartFolding.rememberCursorOnFoldAll": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Fold All remembers your place.** When a fold swallows the cursor's line, VS Code jumps the cursor up to the fold header — this extension detects that jump and remembers the exact pre-fold position (line **and** column) per file, no matter HOW the fold was made (this extension's *Fold All* `Ctrl+K Ctrl+0`, the built-in Fold All, gutter fold icons, fold-level commands…). Running *Unfold All* (`Ctrl+K Ctrl+J`) restores the cursor to that exact spot and scrolls the view back to it — e.g. if you were at line 300, column 24, you land right back there. Disable to keep VS Code's default behavior."
+                },
+                "smartFolding.smartUnfold": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Smart Unfold (focus mode).** After a *Fold All*, unfolding at the remembered cursor expands ONLY the chain of parent blocks around it — from the top level down to the block the cursor is in — while every unrelated function/if/block stays collapsed. The cursor returns to its exact line & column and the view scrolls there. This kicks in (1) automatically for WHATEVER shortcut your keymap binds to the built-in unfold commands (via `#smartFolding.restoreOnAnyUnfold#`), and (2) via the `Smart Folding: Smart Unfold` / `Smart Unfold Recursively` commands in the Command Palette (bind your own keys to them if you like). Great for focusing on one piece of code."
+                },
+                "smartFolding.restoreOnAnyUnfold": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Restore the cursor after ANY unfold — whatever shortcut ran it.** This extension contributes no keybindings: while the cursor is still parked where a Fold All clamped it, any unfold that frees the remembered line (Unfold All, Unfold Recursively, a plain Unfold, a gutter chevron click — with any keymap) puts the cursor back at its exact line & column. Detection is self-verifying, so it works regardless of scroll position or where in the file the cursor was."
+                },
+                "smartFolding.singleLineFolding": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**WebStorm behavior (default):** folding a block collapses it into a **single line** — the closing bracket line is folded away too (`function foo() {···`). **When disabled:** VS Code default — the closing bracket stays visible on its own line below the fold. Re-fold (Ctrl+Shift+[) after changing this setting; already-computed folds refresh on the next folding request."
+                },
+                "smartFolding.keepFunctionParamsVisible": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**WebStorm behavior (default):** parameter lists `( … )` are **not offered as folding regions**, so when you fold a function body the signature line — including its parameters — stays fully visible. **When disabled:** parenthesized groups become foldable too, which can hide parameters when collapsed (VS Code-like). When disabled, the parameter list and body fold together as ONE WebStorm-style region: `async function f(...)`."
+                },
+                "smartFolding.foldComments": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Fold comments.** Multi-line block comments / JSDoc — and runs of consecutive whole-line `//` comments — fold down to a readable one-line badge. Single-line comments like `/* one liner */` or a lone `//` line never fold."
+                },
+                "smartFolding.commentPreview": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Readable comment folds (WebStorm style).** A collapsed comment — its `/**` header included — collapses entirely into the gray badge, which shows the first meaningful text line instead of a plain ellipsis: `/** Remembers the cursor position when folding… */`."
+                },
+                "smartFolding.commentPreviewLength": {
+                    "type": "number",
+                    "default": 60,
+                    "markdownDescription": "Maximum characters of the collapsed-comment preview text (see `#smartFolding.commentPreview#`)."
+                },
+                "smartFolding.hideOpeningBracket": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Render collapsed blocks as `{...}`.** The block's real opening bracket is visually hidden and the badge shows `{...}` (or `[...]` / `(...)`) in its place — `function foo() {...}`, exactly like WebStorm. When disabled, a plain `···` badge is shown after the bracket. Only applies while `smartFolding.singleLineFolding` is enabled — with it off, the closing bracket stays visible on its own line, so the opening bracket is shown too and the badge falls back to a plain `···`."
+                },
+                "smartFolding.hideNativeFoldPlaceholder": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "**Hide VS Code's own `⋯` collapsed-text indicator** that renders to the right of Smart Folding badges. There is no extension API for this, so it is done by setting the `editor.foldPlaceholderForeground` theme color to transparent in your global `workbench.colorCustomizations`. An existing user-set color is never overwritten, and turning this off removes only Smart Folding's own transparent value."
+                },
+                "smartFolding.languages": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [
+                        "javascript",
+                        "javascriptreact",
+                        "typescript",
+                        "typescriptreact",
+                        "json",
+                        "jsonc",
+                        "java",
+                        "c",
+                        "cpp",
+                        "csharp",
+                        "go",
+                        "rust",
+                        "php"
+                    ],
+                    "markdownDescription": "Language IDs for which the WebStorm-style folding-range provider (single-line folds / params visible) is registered. The `···` badge works for every language regardless of this list. Requires a reload after changing."
+                }
+            }
+        }
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Hasan-Mir/vscode-smart-folding"
+    },
+    "bugs": {
+        "url": "https://github.com/Hasan-Mir/vscode-smart-folding/issues"
+    },
+    "scripts": {
+        "build": "tsc -p ./",
+        "package": "npm run build && vsce package",
+        "checktype": "tsc --noEmit",
+        "test": "tsc -p ./ && node --test \"out/test/**/*.test.js\""
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.85.0",
+        "@types/node": "^24.x",
+        "typescript": "^5.x",
+        "@vscode/vsce": "^3.x"
+    }
+}
