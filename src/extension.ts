@@ -1,15 +1,20 @@
 import * as vscode from 'vscode';
 import {
+    addedCursorIndex,
+    badgeClickDropsRememberedCursor,
     CollapsedFold,
     collapsedFolds,
     commentPreviewText,
+    computeFoldBadge,
     computeFoldingRanges,
-    isLikelyFoldClamp,
+    extendCopyRange,
     lineHiddenByFold,
     resolveEllipsisBackground,
     resolveEllipsisColor,
     SimpleFoldingRange,
+    takeoverLanguages,
     unfoldPathForLine,
+    unfoldRevealedGapLines,
 } from './core/folding';
 
 // Fallback only — the real ID is resolved at runtime in activate() from
@@ -32,7 +37,7 @@ let hiddenBracketDecoration: vscode.TextEditorDecorationType | undefined;
 /**
  * Folding ranges per document, cached by document version + options: the
  * scanner is linear and fast, but it would otherwise run on every scroll,
- * selection and fold event.
+ * selection and fold event. Evicted on document close (E-1).
  */
 const rangeCache = new Map<
     string,
@@ -43,10 +48,10 @@ function rangesFor(document: vscode.TextDocument): SimpleFoldingRange[] {
     const c = vscode.workspace.getConfiguration('smartFolding');
     const opts = {
         singleLineFolds: c.get<boolean>('singleLineFolding', true),
-        keepFunctionParamsVisible: c.get<boolean>('keepFunctionParamsVisible', true),
         foldComments: c.get<boolean>('foldComments', true),
+        languageId: document.languageId,
     };
-    const optsKey = `${opts.singleLineFolds}|${opts.keepFunctionParamsVisible}|${opts.foldComments}`;
+    const optsKey = `${opts.singleLineFolds}|${opts.foldComments}|${document.languageId}`;
     const key = document.uri.toString();
     const cached = rangeCache.get(key);
     if (cached && cached.version === document.version && cached.optsKey === optsKey) {
@@ -58,7 +63,7 @@ function rangesFor(document: vscode.TextDocument): SimpleFoldingRange[] {
 }
 
 /**
- * Cursor/selection state remembered per document when the user runs
+ * Cursor/selection state remembered when the user runs
  * "Fold All (Remember Cursor)".
  *
  * IMPORTANT: the state is kept until it is SUCCESSFULLY restored by
@@ -76,9 +81,56 @@ interface SavedFoldState {
      * the remembered state is then stale and gets dropped.
      */
     clampedActive?: vscode.Position;
+    /**
+     * E-3: document version at the moment Fold All ran. Any later edit (even
+     * one from a background tab or another extension, which never reaches the
+     * edit listener for a non-visible editor) invalidates the remembered
+     * positions — restoring them would land on the wrong logical position.
+     */
+    docVersion: number;
 }
 
-const savedStates = new Map<string, SavedFoldState>();
+/**
+ * E-2: editor-level state is keyed by the TextEditor itself (WeakMap), not
+ * by document URI — a document shown in two editor groups no longer
+ * overwrites its own selections, remembered folds or clamp bookkeeping, and
+ * everything here is garbage-collected with the editor (E-1).
+ */
+interface EditorMemory {
+    savedState?: SavedFoldState;
+    lastSelections?: vscode.Selection[];
+    rememberedFolds?: { version: number; folds: CollapsedFold[] };
+    lastVisible?: Array<{ startLine: number; endLine: number }>;
+    /** E-5: set when an UNFOLD transition was observed in the visible ranges. */
+    unfoldSignal?: boolean;
+}
+
+const editorMemory = new WeakMap<vscode.TextEditor, EditorMemory>();
+
+function mem(editor: vscode.TextEditor): EditorMemory {
+    let m = editorMemory.get(editor);
+    if (!m) {
+        m = {};
+        editorMemory.set(editor, m);
+    }
+    return m;
+}
+
+/**
+ * E-3/F-G: remembered cursor state is only valid for the document version it
+ * was saved at. Returns the state, discarding it when the document changed —
+ * this also covers edits applied to a NON-visible editor (background tab,
+ * formatter, source control), which the edit listener never sees because
+ * `visibleTextEditors` only lists the editors currently rendered.
+ */
+function liveState(editor: vscode.TextEditor): SavedFoldState | undefined {
+    const state = mem(editor).savedState;
+    if (state && state.docVersion !== editor.document.version) {
+        mem(editor).savedState = undefined;
+        return undefined;
+    }
+    return state;
+}
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(() => resolve(), ms));
 
@@ -97,8 +149,70 @@ function selectionsEqual(a: readonly vscode.Selection[], b: readonly vscode.Sele
     );
 }
 
+// --- (4) Hide VS Code's native `···` fold placeholder ----------------------
+// No decoration/extension API can suppress the built-in collapsed-text
+// indicator, but its THEME COLOR (`editor.foldPlaceholderForeground`,
+// VS Code ≥ 1.81) can be made fully transparent. Managed in the user's
+// global `workbench.colorCustomizations`: an existing user-set color is
+// never overwritten, and only our own transparent value is ever removed
+// (E-10 merges from the GLOBAL value only; E-11 tracks ownership).
+const PLACEHOLDER_COLOR = 'editor.foldPlaceholderForeground';
+const TRANSPARENT_COLOR = '#00000000';
+/** globalState key recording whether the transparent value is OURS (E-11). */
+const OWNED_PLACEHOLDER_KEY = 'smartFolding.ownedPlaceholderColor';
+/** True when the transparent value currently in settings was written by us. */
+let ownedPlaceholderColor = false;
+
+const syncNativePlaceholder = async (context?: vscode.ExtensionContext): Promise<void> => {
+    try {
+        const hide = vscode.workspace
+            .getConfiguration('smartFolding')
+            .get<boolean>('hideNativeFoldPlaceholder', true);
+        const workbench = vscode.workspace.getConfiguration('workbench');
+        // E-10: NEVER use `workbench.get('colorCustomizations')` as the merge
+        // base — `get()` returns the EFFECTIVE (workspace-merged) value, and
+        // writing that to ConfigurationTarget.Global silently persists
+        // workspace keys into the user's global settings.json.
+        const inspected = workbench.inspect<Record<string, unknown>>('colorCustomizations');
+        const colors = inspected?.globalValue ?? {};
+        const current = colors[PLACEHOLDER_COLOR];
+        // E-11: ownership is PERSISTED, so a value the USER writes later (even
+        // one equal to our transparent marker) is never mistaken for ours and
+        // deleted. No record at all means a pre-persistence install: fall back
+        // to value equality once, exactly like earlier versions did.
+        const recorded = context?.globalState.get<boolean | undefined>(OWNED_PLACEHOLDER_KEY);
+        if (recorded !== undefined) {
+            ownedPlaceholderColor = recorded;
+        } else if (current === TRANSPARENT_COLOR) {
+            ownedPlaceholderColor = true;
+        }
+        if (hide && current === undefined) {
+            await workbench.update(
+                'colorCustomizations',
+                { ...colors, [PLACEHOLDER_COLOR]: TRANSPARENT_COLOR },
+                vscode.ConfigurationTarget.Global
+            );
+            ownedPlaceholderColor = true;
+        } else if (!hide && current === TRANSPARENT_COLOR && ownedPlaceholderColor) {
+            const next: Record<string, unknown> = { ...colors };
+            delete next[PLACEHOLDER_COLOR];
+            await workbench.update('colorCustomizations', next, vscode.ConfigurationTarget.Global);
+            ownedPlaceholderColor = false;
+        }
+        await context?.globalState.update(OWNED_PLACEHOLDER_KEY, ownedPlaceholderColor);
+    } catch {
+        // E-12: writing user settings can fail (read-only profile, remote) —
+        // non-fatal, never an unhandled rejection.
+    }
+};
+
 export function activate(context: vscode.ExtensionContext): void {
-    // Resolve the real extension ID at runtime (rename-proof).
+    // Resolve the real extension ID at runtime (rename-proof). NOTE: no
+    // self-check against `vscode.extensions.getExtension(EXTENSION_ID)` — the
+    // uninstall cleanup does NOT run through activation (the manifest's
+    // `vscode:uninstall` "activation event" was never a valid one; see
+    // `scripts/uninstall.js`), so the old check was dead code whose only
+    // possible effect was to disable the extension when the lookup failed.
     EXTENSION_ID = context.extension.id;
 
     const cfg = () => vscode.workspace.getConfiguration('smartFolding');
@@ -108,41 +222,7 @@ export function activate(context: vscode.ExtensionContext): void {
     // ignore those synthetic events.
     let autoRestoring = false;
 
-    // --- (4) Hide VS Code's native `···` fold placeholder --------------------
-    // No decoration/extension API can suppress the built-in collapsed-text
-    // indicator, but its THEME COLOR (`editor.foldPlaceholderForeground`,
-    // VS Code ≥ 1.81) can be made fully transparent. Managed in the user's
-    // global `workbench.colorCustomizations`: an existing user-set color is
-    // never overwritten, and only our own transparent value is ever removed.
-    const PLACEHOLDER_COLOR = 'editor.foldPlaceholderForeground';
-    const TRANSPARENT_COLOR = '#00000000';
-    const syncNativePlaceholder = async (): Promise<void> => {
-        const hide = vscode.workspace
-            .getConfiguration('smartFolding')
-            .get<boolean>('hideNativeFoldPlaceholder', true);
-        const workbench = vscode.workspace.getConfiguration('workbench');
-        const colors = workbench.get<Record<string, unknown>>('colorCustomizations') ?? {};
-        try {
-            if (hide && colors[PLACEHOLDER_COLOR] === undefined) {
-                await workbench.update(
-                    'colorCustomizations',
-                    { ...colors, [PLACEHOLDER_COLOR]: TRANSPARENT_COLOR },
-                    vscode.ConfigurationTarget.Global
-                );
-            } else if (!hide && colors[PLACEHOLDER_COLOR] === TRANSPARENT_COLOR) {
-                const next: Record<string, unknown> = { ...colors };
-                delete next[PLACEHOLDER_COLOR];
-                await workbench.update(
-                    'colorCustomizations',
-                    next,
-                    vscode.ConfigurationTarget.Global
-                );
-            }
-        } catch {
-            // Writing user settings can fail (read-only profile) — non-fatal.
-        }
-    };
-    void syncNativePlaceholder();
+    void syncNativePlaceholder(context);
 
     // Fired when a setting that changes the COMPUTED ranges flips, so VS Code
     // re-queries the provider immediately instead of waiting for an edit.
@@ -188,21 +268,30 @@ export function activate(context: vscode.ExtensionContext): void {
             'editor.foreground'
         );
 
+        const baseStyles = {
+            // contentText comes from each decoration INSTANCE (the badge
+            // text differs per fold). Defining it here TOO made VS Code
+            // render a second ' ··· ' badge next to every {...} badge.
+            margin: '0 0 0 0.5ch',
+            fontWeight: 'bold',
+            // CSS injection via textDecoration — a well-known decoration trick to
+            // get rounded corners, padding and a pointer cursor.
+            textDecoration: 'none; border-radius: 4px; padding: 0 5px; cursor: pointer;',
+        };
+
         return vscode.window.createTextEditorDecorationType({
-            after: {
-                // contentText comes from each decoration INSTANCE (the badge
-                // text differs per fold). Defining it here TOO made VS Code
-                // render a second ' ··· ' badge next to every {...} badge.
-                margin: '0 0 0 0.5ch',
-                fontWeight: 'bold',
-                // CSS injection via textDecoration — a well-known decoration trick to
-                // get rounded corners, padding and a pointer cursor.
-                textDecoration: 'none; border-radius: 4px; padding: 0 5px; cursor: pointer;',
-            },
+            after: baseStyles,
+            before: baseStyles,
             // VS Code automatically applies the block matching the active theme
             // kind, so the badge can be styled independently for dark & light.
-            dark: { after: { backgroundColor: darkBackground, color: darkColor } },
-            light: { after: { backgroundColor: lightBackground, color: lightColor } },
+            dark: {
+                after: { backgroundColor: darkBackground, color: darkColor },
+                before: { backgroundColor: darkBackground, color: darkColor },
+            },
+            light: {
+                after: { backgroundColor: lightBackground, color: lightColor },
+                before: { backgroundColor: lightBackground, color: lightColor },
+            },
         });
     };
 
@@ -267,6 +356,58 @@ export function activate(context: vscode.ExtensionContext): void {
         if (editor) updateEllipsisDecorations(editor, cfg().get<boolean>('enhancedEllipsis', true));
     };
 
+    // E-13: decorations must also refresh after EDITS — the range cache is
+    // version-aware, so a refresh recomputes cheaply only when needed.
+    // Debounced: typing fires bursts of change events. The pending set keeps
+    // EVERY editor showing the edited document fresh (a document shown in two
+    // editor groups does not share decorations) and burst edits in several
+    // documents all refresh instead of only the last one.
+    let editRefreshTimer: NodeJS.Timeout;
+    const pendingEditRefresh = new Set<vscode.TextEditor>();
+    context.subscriptions.push(
+        {
+            dispose: () => {
+                clearTimeout(editRefreshTimer);
+                pendingEditRefresh.clear();
+            },
+        },
+        vscode.workspace.onDidChangeTextDocument(e => {
+            for (const editor of vscode.window.visibleTextEditors) {
+                if (editor.document === e.document) pendingEditRefresh.add(editor);
+            }
+            if (pendingEditRefresh.size === 0) return;
+            clearTimeout(editRefreshTimer);
+            editRefreshTimer = setTimeout(() => {
+                const editors = [...pendingEditRefresh];
+                pendingEditRefresh.clear();
+                for (const editor of editors) {
+                    if (vscode.window.visibleTextEditors.includes(editor)) {
+                        refresh(editor);
+                    }
+                }
+            }, 50);
+        })
+    );
+
+    // E-1/E-3: document lifecycle — evict cached ranges on close and DISCARD
+    // remembered cursor state on ANY edit (a Selection refers to positions
+    // from the moment Fold All ran; restoring it after an edit could land on
+    // the wrong logical position — discard instead of rebasing).
+    context.subscriptions.push(
+        vscode.workspace.onDidCloseTextDocument(document => {
+            rangeCache.delete(document.uri.toString());
+            // Editor-level state lives in editorMemory (WeakMap<TextEditor>)
+            // and is garbage-collected with the editor — nothing to evict.
+        }),
+        vscode.workspace.onDidChangeTextDocument(e => {
+            for (const editor of vscode.window.visibleTextEditors) {
+                if (editor.document === e.document) {
+                    mem(editor).savedState = undefined;
+                }
+            }
+        })
+    );
+
     context.subscriptions.push(
         vscode.window.onDidChangeTextEditorVisibleRanges(e => refresh(e.textEditor)),
         vscode.window.onDidChangeActiveTextEditor(e => refresh(e)),
@@ -288,16 +429,18 @@ export function activate(context: vscode.ExtensionContext): void {
             }
             if (
                 e.affectsConfiguration('smartFolding.singleLineFolding') ||
-                e.affectsConfiguration('smartFolding.keepFunctionParamsVisible') ||
                 e.affectsConfiguration('smartFolding.foldComments')
             ) {
                 foldingRangesChanged.fire();
             }
             if (e.affectsConfiguration('smartFolding.hideNativeFoldPlaceholder')) {
-                void syncNativePlaceholder();
+                void syncNativePlaceholder(context);
             }
-            if (e.affectsConfiguration('smartFolding.takeOverFolding')) {
-                void ensureDefaultFoldingProvider();
+            if (
+                e.affectsConfiguration('smartFolding.takeOverFolding') ||
+                e.affectsConfiguration('smartFolding.languages')
+            ) {
+                void ensureDefaultFoldingProvider(context);
             }
             if (e.affectsConfiguration('smartFolding')) {
                 for (const editor of vscode.window.visibleTextEditors) refresh(editor);
@@ -319,6 +462,92 @@ export function activate(context: vscode.ExtensionContext): void {
         })
     );
 
+    // --- Copying collapsed blocks -------------------------------------------
+    // With single-line folding the closing bracket line is hidden too, so a
+    // native copy of the visible row yields BROKEN code. This Ctrl+C/Cmd+C
+    // override (bound only while `smartFolding.copyFoldedBlocks` is on — the
+    // keybinding's `when` clause checks the setting) widens the copy: a line
+    // copy (empty selection) on a collapsed header copies the whole block,
+    // and a selection reaching the collapsed row's visible end is extended
+    // through the hidden lines. Every other copy falls back to the built-in
+    // action, keeping its paste metadata (line paste, multi-cursor spread…).
+    context.subscriptions.push(
+        vscode.commands.registerCommand('smartFolding.clipboardCopy', async () => {
+            const native = (): Thenable<unknown> =>
+                vscode.commands.executeCommand('editor.action.clipboardCopyAction');
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) return native();
+            const c = cfg();
+            const ranges = rangesFor(editor.document);
+            const folds = currentCollapsedFolds(editor, ranges);
+            if (folds.length === 0) return native();
+            const doc = editor.document;
+            const len = (l: number): number => doc.lineAt(l).text.length;
+            // The badge may visually replace the end of the header row, so a
+            // mouse drag "to the end" stops at the first hidden column —
+            // before the line's real end. Treat that as selected-to-the-end.
+            const visibleEnd = (l: number): number => {
+                const fold = folds.find(f => f.header === l);
+                if (!fold) return len(l);
+                const { hiddenStart } = foldBadge(editor, l, ranges, c, fold.hiddenEnd);
+                return Math.min(hiddenStart ?? len(l), len(l));
+            };
+            let widened = false;
+            let anyPiece = false;
+            // E-9: a line-copy trailing newline is added only when EVERY
+            // piece is a line copy (one unrelated line-copy selection must
+            // not turn the whole multi-cursor clipboard into a line copy).
+            let allLineCopy = true;
+            const pieces: string[] = [];
+            for (const sel of editor.selections) {
+                const ext = extendCopyRange(
+                    {
+                        startLine: sel.start.line,
+                        startCharacter: sel.start.character,
+                        endLine: sel.end.line,
+                        endCharacter: sel.end.character,
+                    },
+                    folds,
+                    len,
+                    visibleEnd
+                );
+                if (ext === undefined) {
+                    anyPiece = true;
+                    pieces.push(
+                        sel.isEmpty
+                            ? doc.lineAt(sel.start.line).text
+                            : doc.getText(new vscode.Range(sel.start, sel.end))
+                    );
+                    if (!sel.isEmpty) allLineCopy = false;
+                    continue;
+                }
+                widened = true;
+                anyPiece = true;
+                if (!ext.isLineCopy) allLineCopy = false;
+                pieces.push(
+                    doc.getText(
+                        new vscode.Range(
+                            new vscode.Position(ext.startLine, ext.startCharacter),
+                            new vscode.Position(ext.endLine, ext.endCharacter)
+                        )
+                    )
+                );
+            }
+            // No collapsed block was touched: the built-in copy handles it.
+            if (!widened) return native();
+            // E-9: use the document's real EOL; any clipboard failure falls
+            // back to the native copy instead of breaking copy entirely.
+            const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+            try {
+                await vscode.env.clipboard.writeText(
+                    pieces.join(eol) + (allLineCopy && anyPiece ? eol : '')
+                );
+            } catch {
+                return native();
+            }
+        })
+    );
+
     // Click-to-expand: clicking on the badge area of a folded start line
     // unfolds that block — emulating WebStorm's large clickable ellipsis.
     // Holding the multi-cursor modifier (Alt by default — see VS Code's
@@ -336,6 +565,7 @@ export function activate(context: vscode.ExtensionContext): void {
             if (autoRestoring) return;
             const c = cfg();
             const editor = e.textEditor;
+            const m = mem(editor);
             const ranges = rangesFor(editor.document);
             const folds = currentCollapsedFolds(editor, ranges);
             if (folds.length === 0) return;
@@ -343,11 +573,15 @@ export function activate(context: vscode.ExtensionContext): void {
             // collapsed row does NOT reliably put the cursor on the header
             // line: VS Code may map a click on/past injected text to the END
             // of the folded (hidden) content instead. Both cases resolve to
-            // the fold's header line here \u2014 relying on the header line only
+            // the fold's header line here — relying on the header line only
             // was the "clicking {...} doesn't unfold" bug.
             const targetFoldStart = (p: vscode.Position): number | undefined => {
                 const asHeader = folds.find(f => f.header === p.line);
                 if (asHeader) {
+                    // clickLineToExpand: the WHOLE header row is a click
+                    // target — any click on the collapsed line expands the
+                    // block, no need to aim at the `···` badge itself.
+                    if (c.get<boolean>('clickLineToExpand', false)) return p.line;
                     const { hiddenStart } = foldBadge(
                         editor,
                         p.line,
@@ -359,31 +593,75 @@ export function activate(context: vscode.ExtensionContext): void {
                     return p.character >= threshold ? p.line : undefined;
                 }
                 // The gap itself tells us the header — no range guessing.
-                return folds.find(f => p.line > f.header && p.line <= f.hiddenEnd)?.header;
+                const gap = folds.find(f => p.line > f.header && p.line <= f.hiddenEnd);
+                if (!gap) return undefined;
+                return gap.header;
+            };
+
+            // A badge click that expands a block CONTAINING the cursor
+            // position remembered by Fold All is a deliberate, manual way of
+            // expanding — drop the remembered state BEFORE unfolding, so the
+            // automatic restore (probe + Smart Unfold) cannot kick in and
+            // teleport the cursor back to its old position. Without this,
+            // clicking the badge of an ANCESTOR of the remembered cursor
+            // expanded the whole parent chain and jumped the cursor there.
+            // Clicks on unrelated blocks keep the remembered position, so
+            // Unfold All can still restore it later.
+            const dropRememberedCursorFor = (headerLine: number): void => {
+                const state = m.savedState;
+                if (!state || state.selections.length === 0) return;
+                const fold = folds.find(f => f.header === headerLine);
+                if (!fold) return;
+                if (badgeClickDropsRememberedCursor(fold, state.selections[0].active.line)) {
+                    m.savedState = undefined;
+                }
             };
 
             // Modifier+click: VS Code exposes no modifier keys on mouse
             // events, but the multi-cursor modifier ADDS a cursor — a mouse
             // selection event with 2+ selections. When the added cursor sits
-            // on a collapsed fold's badge, treat it as modifier+click: drop
-            // the extra cursor and expand that block recursively.
+            // on a collapsed fold's badge, treat it as modifier+click.
             if (
                 e.selections.length >= 2 &&
                 c.get<boolean>('modifierClickExpandsRecursively', true)
             ) {
+                // E-8: target the NEWLY-ADDED cursor (diff against the
+                // pre-event selections), not the first empty selection in
+                // document order — a pre-existing cursor above the clicked
+                // badge used to win.
+                const prevPositions = (m.lastSelections ?? []).map(s => ({
+                    line: s.active.line,
+                    character: s.active.character,
+                }));
+                const added = addedCursorIndex(
+                    prevPositions,
+                    e.selections.map(s => ({ line: s.active.line, character: s.active.character }))
+                );
                 let hit: number | undefined;
-                for (const s of e.selections) {
-                    if (s.isEmpty) hit = targetFoldStart(s.active);
-                    if (hit !== undefined) break;
+                if (added >= 0) {
+                    const s = e.selections[added];
+                    if (s.isEmpty) {
+                        hit = targetFoldStart(s.active);
+                    }
+                }
+                if (hit === undefined) {
+                    // Fallback: no detectable new cursor — first empty one.
+                    for (const s of e.selections) {
+                        if (s.isEmpty) {
+                            hit = targetFoldStart(s.active);
+                        }
+                        if (hit !== undefined) break;
+                    }
                 }
                 if (hit === undefined) return;
+                dropRememberedCursorFor(hit);
                 autoRestoring = true;
                 try {
                     const p = new vscode.Position(hit, editor.document.lineAt(hit).text.length);
                     editor.selections = [new vscode.Selection(p, p)];
-                    // editor.unfoldRecursively ignores selectionLines args —
-                    // it acts on the current selection, set just above.
                     await vscode.commands.executeCommand('editor.unfoldRecursively');
+                    // Keep cursor on the clicked block to prevent visual bounce / flicker
+                    editor.selections = [new vscode.Selection(p, p)];
                 } finally {
                     autoRestoring = false;
                 }
@@ -394,6 +672,7 @@ export function activate(context: vscode.ExtensionContext): void {
             if (e.selections.length !== 1 || !e.selections[0].isEmpty) return;
             const target = targetFoldStart(e.selections[0].active);
             if (target === undefined) return;
+            dropRememberedCursorFor(target);
             await vscode.commands.executeCommand('editor.unfold', {
                 levels: 1,
                 selectionLines: [target],
@@ -466,25 +745,24 @@ export function activate(context: vscode.ExtensionContext): void {
     // "…): Promise<boolean> => {<cursor>". If only our own Fold All command
     // saved the position, folds made any other way lost it forever.
     //
-    // So we continuously remember the last selections per document and detect
+    // So we continuously remember the last selections per editor and detect
     // the fold-induced jump itself: a non-mouse/non-keyboard selection change
     // that moved the cursor UP while its previous line is now hidden INSIDE a
     // fold (not merely scrolled off-screen). The pre-fold selections are then
     // stored for Unfold All / Smart Unfold — no matter how the fold was made.
-    const lastSelections = new Map<string, vscode.Selection[]>();
     const seedLastSelections = (editor: vscode.TextEditor | undefined): void => {
         if (!editor) return;
-        lastSelections.set(editor.document.uri.toString(), cloneSelections(editor.selections));
+        mem(editor).lastSelections = cloneSelections(editor.selections);
     };
     for (const editor of vscode.window.visibleTextEditors) seedLastSelections(editor);
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(seedLastSelections),
         vscode.window.onDidChangeTextEditorSelection(e => {
             const editor = e.textEditor;
-            const key = editor.document.uri.toString();
-            const prev = lastSelections.get(key);
+            const m = mem(editor);
+            const prev = m.lastSelections;
             const next = cloneSelections(e.selections);
-            lastSelections.set(key, next);
+            m.lastSelections = next;
             if (autoRestoring) return; // our own probe/restore moves
             if (!prev || prev.length === 0 || next.length === 0) return;
             const c = cfg();
@@ -503,13 +781,13 @@ export function activate(context: vscode.ExtensionContext): void {
                 e.kind === vscode.TextEditorSelectionChangeKind.Mouse ||
                 e.kind === vscode.TextEditorSelectionChangeKind.Keyboard
             ) {
-                const state = savedStates.get(key);
+                const state = m.savedState;
                 if (state && state.selections.length > 0) {
                     const line = next[0].active.line;
                     const savedLine = state.selections[0].active.line;
                     const clampedLine = state.clampedActive?.line;
                     if (line !== savedLine && line !== clampedLine) {
-                        savedStates.delete(key);
+                        m.savedState = undefined;
                     }
                 }
                 return;
@@ -517,30 +795,55 @@ export function activate(context: vscode.ExtensionContext): void {
             const prevActive = prev[0].active;
             const nextActive = next[0].active;
             // A fold clamp always moves the cursor UP (to the fold header line).
-            if (nextActive.line >= prevActive.line) return;
-
-            // Detect the clamp from the folding ranges themselves. This is the
-            // reliable path for folds at EOF and for old cursor lines outside the
-            // viewport, where `visibleRanges` cannot distinguish folded from merely
-            // scrolled-away text.
-            const ranges = rangesFor(editor.document);
-            if (isLikelyFoldClamp(ranges, prevActive.line, nextActive.line)) {
-                savedStates.set(key, { selections: prev, clampedActive: nextActive });
+            if (nextActive.line >= prevActive.line) {
                 return;
             }
 
+            // E-6: the candidate is verified AFTER the folding model settles
+            // (60 ms) — a programmatic jump (Go to Definition from a body
+            // line to the header line of the SAME range) looks identical to
+            // a fold clamp in the instant it happens, but the previous line
+            // is then NOT hidden inside a fold (and the range does not reach
+            // EOF). Genuine clamps pass exactly one of those two checks, so
+            // ordinary upward navigation never arms saved fold state.
             const docVersion = editor.document.version;
-            // The folding model / visibleRanges apply asynchronously — verify
-            // shortly afterwards, once the hidden areas are final.
             setTimeout(() => {
-                if (editor.document.version !== docVersion) return; // text changed — not a pure fold
-                if (!selectionsEqual(editor.selections, next)) return; // cursor moved again since
+                if (editor.document.version !== docVersion) {
+                    return;
+                }
+                // Allow same-line nudge from parkCursorOutsideBadge
+                const currentActive = editor.selection.active;
+                const onSameClampLine = currentActive.line === nextActive.line;
+                if (!selectionsEqual(editor.selections, next) && !onSameClampLine) {
+                    return;
+                }
                 const visible = editor.visibleRanges.map(r => ({
                     startLine: r.start.line,
                     endLine: r.end.line,
                 }));
-                if (!lineHiddenByFold(visible, prevActive.line)) return;
-                savedStates.set(key, { selections: prev, clampedActive: nextActive });
+                const hidden = lineHiddenByFold(visible, prevActive.line);
+                const rs = rangesFor(editor.document);
+                
+                // Find last non-empty code line to safely handle trailing blank lines near EOF
+                let lastCodeLine = editor.document.lineCount - 1;
+                while (lastCodeLine > 0 && editor.document.lineAt(lastCodeLine).text.trim().length === 0) {
+                    lastCodeLine--;
+                }
+                const reachesEof = rs.some(
+                    r =>
+                        r.start === nextActive.line &&
+                        prevActive.line > r.start &&
+                        prevActive.line <= r.end &&
+                        r.end >= lastCodeLine
+                );
+                if (!hidden && !reachesEof) {
+                    return;
+                }
+                m.savedState = {
+                    selections: prev,
+                    clampedActive: nextActive,
+                    docVersion,
+                };
             }, 60);
         })
     );
@@ -551,33 +854,38 @@ export function activate(context: vscode.ExtensionContext): void {
             const editor = vscode.window.activeTextEditor;
             if (!editor) return;
             const remember = cfg().get<boolean>('rememberCursorOnFoldAll', true);
-            const saved = cloneSelections(editor.selections);
-            if (remember) {
-                savedStates.set(editor.document.uri.toString(), { selections: saved });
-            }
+            // Capture BEFORE folding so we can tell whether a clamp happened.
+            const before = cloneSelections(editor.selections);
             await vscode.commands.executeCommand('editor.foldAll');
-            if (remember) {
-                // Give the folding model a moment to clamp the cursor, then
-                // record the clamp position (the fold header). Deliberate
-                // moves away from it later invalidate the remembered state.
-                await sleep(40);
-                const state = savedStates.get(editor.document.uri.toString());
-                if (state && !state.clampedActive) {
-                    state.clampedActive = editor.selection.active;
-                }
+            if (!remember) return;
+            // Give the folding model a moment to clamp the cursor.
+            await sleep(100);
+            const m = mem(editor);
+            // E-4: keep restore state ONLY when the fold actually clamped the
+            // cursor (post-fold selection ≠ pre-fold selection). A no-op Fold
+            // All previously armed the restore logic unconditionally, and a
+            // later mere scroll "restored" the viewport to a stale position.
+            if (!selectionsEqual(before, cloneSelections(editor.selections))) {
+                m.savedState = {
+                    selections: before,
+                    clampedActive: editor.selection.active,
+                    docVersion: editor.document.version,
+                };
+            } else {
+                m.savedState = undefined;
             }
             // Do not assign the saved selection while its line is hidden. VS Code
             // clamps it to the fold header again (and can emit another selection
             // event), which was the source of the lost/overwritten cursor state.
-            // Keep the saved position only in `savedStates`; restore it after unfold.
+            // Keep the saved position only in memory; restore it after unfold.
         }),
 
         vscode.commands.registerCommand('smartFolding.unfoldAll', async () => {
             const editor = vscode.window.activeTextEditor;
             if (!editor) return;
             await vscode.commands.executeCommand('editor.unfoldAll');
-            const key = editor.document.uri.toString();
-            const state = savedStates.get(key);
+            const m = mem(editor);
+            const state = liveState(editor);
             if (state && cfg().get<boolean>('rememberCursorOnFoldAll', true)) {
                 // The folding model applies asynchronously: keep re-applying the
                 // selection + scroll until the cursor line is actually rendered.
@@ -592,7 +900,7 @@ export function activate(context: vscode.ExtensionContext): void {
                     }
                 }
                 // Never discard the remembered position until restoration succeeds.
-                if (restored) savedStates.delete(key);
+                if (restored) m.savedState = undefined;
             }
         }),
 
@@ -623,33 +931,27 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     // --- Restore cursor after ANY unfold — no hardcoded shortcuts -------------
-    // This extension contributes NO keybindings: whatever key the user's own
+    // This extension contributes NO unfold keybindings: whatever key the user's own
     // keymap binds to Unfold / Unfold Recursively / Unfold All (Alt+W,
     // Ctrl+Shift+=, the Command Palette, a gutter chevron click…), the
     // BUILT-IN command runs and this extension reacts to its effect.
     //
-    // VS Code fires no "unfolded" event. Comparing consecutive visible-range
-    // snapshots (the previous approach) broke whenever the unfold and its
-    // follow-up reveal-scroll arrived as SEPARATE events — which is exactly
-    // why restore only worked for blocks that happened to be near the
-    // viewport after the unfold. Detection is now SELF-VERIFYING instead:
-    //
-    // While a remembered cursor exists and the cursor is still parked where
-    // the fold clamped it, every viewport change runs a silent probe that
+    // VS Code fires no "unfolded" event. Detection is SELF-VERIFYING: while a
+    // remembered cursor exists and the cursor is still parked where the fold
+    // clamped it, an observed UNFOLD TRANSITION triggers a silent probe that
     // tries to put the selection back on the remembered line:
-    //   - It STICKS → every fold hiding the line is open (fold-hidden lines
-    //     can never be selected — only a real unfold makes this possible) →
-    //     restore the cursor (line AND column) + scroll, consume the state.
+    //   - It STICKS → every fold hiding the line is open → restore the cursor
+    //     (line AND column) + scroll, consume the state.
     //   - It clamps to a DEEPER fold header → the unfold opened the outer
     //     block but the line is still nested-hidden → finish opening the
     //     parent chain (smart unfold), keeping unrelated blocks folded.
-    //   - It clamps straight back → unrelated unfold or plain scrolling →
-    //     put the cursor back and keep waiting.
+    //   - It clamps straight back → unrelated change → put the cursor back
+    //     and keep waiting.
     // The probe assigns the selection WITHOUT scrolling, so failed probes are
     // invisible and never hijack the viewport.
     const probeRestore = async (editor: vscode.TextEditor): Promise<void> => {
-        const key = editor.document.uri.toString();
-        const state = savedStates.get(key);
+        const m = mem(editor);
+        const state = liveState(editor);
         if (!state || state.selections.length === 0) return;
         const c = cfg();
         if (!c.get<boolean>('rememberCursorOnFoldAll', true)) return;
@@ -661,28 +963,18 @@ export function activate(context: vscode.ExtensionContext): void {
         if (parked.line !== state.clampedActive?.line && parked.line !== saved.line) return;
         // Fast path: the remembered line is already rendered → folds are open.
         if (lineIsRendered(editor, saved.line)) {
-            savedStates.delete(key);
+            m.savedState = undefined;
             restoreView(editor, state.selections);
             return;
         }
 
-        // Do not probe merely because the viewport changed after a FOLD.
-        // Assigning a selection into a still-hidden line is not a harmless
-        // query: VS Code clamps it to the deepest visible fold header. The old
-        // probe interpreted that clamp as unfold progress and immediately
-        // smart-unfolded the block that had just been folded. A real unfold of
-        // the clamping fold necessarily renders its first body line; scrolling
-        // (and a freshly collapsed fold) does not. Gate every mutating probe on
-        // that observable transition instead of guessing from missing nested
-        // ranges, which are absent simply because their parent is collapsed.
-        const clampLine = state.clampedActive?.line;
-        if (
-            clampLine !== undefined &&
-            clampLine + 1 < editor.document.lineCount &&
-            !lineIsRendered(editor, clampLine + 1)
-        ) {
-            return;
-        }
+        // E-5: gate on the STATE SIGNAL ("did an unfold actually happen?"),
+        // not on viewport-relative visibility. The old gate — "is
+        // clampLine+1 rendered" — silently skipped restoration whenever the
+        // user had scrolled the clamp line away, then surprised them with a
+        // delayed smartUnfold when they scrolled back.
+        if (!m.unfoldSignal) return;
+        m.unfoldSignal = false;
 
         autoRestoring = true;
         try {
@@ -695,7 +987,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 // until the line scrolled into view meant every later scroll
                 // event re-probed and yanked the viewport back up (the
                 // "can't scroll down after Unfold All" jump).
-                savedStates.delete(key);
+                m.savedState = undefined;
                 restoreView(editor, state.selections);
                 for (let attempt = 0; attempt < 4; attempt++) {
                     await sleep(30);
@@ -704,7 +996,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 }
                 return;
             } else if (
-                landedLine > (clampLine ?? parked.line) &&
+                landedLine > (state.clampedActive?.line ?? parked.line) &&
                 landedLine <= saved.line &&
                 !lineIsRendered(editor, saved.line) &&
                 c.get<boolean>('smartUnfold', true)
@@ -712,7 +1004,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 // Clamped to a DIFFERENT, deeper fold header → the user's
                 // unfold opened the outer block → finish the parent chain.
                 await smartUnfold(editor);
-                if (!savedStates.has(key)) return; // consumed on success
+                if (m.savedState === undefined) return; // consumed on success
             }
             // Not restorable yet — park the cursor back where it was and keep
             // the remembered state for the next unfold.
@@ -732,7 +1024,20 @@ export function activate(context: vscode.ExtensionContext): void {
             if (autoRestoring) return;
             const editor = e.textEditor;
             if (editor !== vscode.window.activeTextEditor) return;
-            if (!savedStates.has(editor.document.uri.toString())) return;
+            const m = mem(editor);
+            const cur = e.visibleRanges.map(r => ({
+                startLine: r.start.line,
+                endLine: r.end.line,
+            }));
+            const prev = m.lastVisible ?? [];
+            m.lastVisible = cur;
+            // E-5: an unfold MERGES previously separated visible ranges (or
+            // reveals a fold-hidden gap in place); a fold or plain scroll
+            // never does. This is the state signal the probe gates on.
+            if (cur.length < prev.length || unfoldRevealedGapLines(prev, cur)) {
+                m.unfoldSignal = true;
+            }
+            if (!m.savedState) return;
             // Fold/unfold transitions fire bursts of events — debounce, then
             // probe once the folding model has settled.
             clearTimeout(probeTimer);
@@ -741,18 +1046,17 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     // --- (b) + (b.1) WebStorm-style folding ranges ---------------------------
-    // Single-line folds (closing bracket folded away) and parameter lists kept
-    // visible, both configurable.
+    // Single-line folds (closing bracket folded away), configurable.
     //
-    // VS Code merges folding ranges from ALL providers (the built-in language
-    // provider included) and, when two ranges start on the same line, the MOST
-    // RECENTLY registered provider wins. Built-in language providers register
-    // lazily when a language first loads — usually AFTER extension activation —
-    // which silently demoted our ranges. Two defenses:
-    //   1. `takeOverFolding` (default ON) sets `editor.defaultFoldingRangeProvider`
-    //      to this extension — the GUARANTEED fix (see ensureDefaultFoldingProvider).
-    //   2. The delayed re-registration below keeps our provider the most recent
-    //      as a fallback when take-over is disabled.
+    // The provider below is the SOLE folding source for takeover languages
+    // (see `editor.defaultFoldingRangeProvider`, applied by
+    // ensureDefaultFoldingProvider): it returns a unified, deterministic
+    // folding model — native-equivalent ranges from the same bracket scanner
+    // the parity harness checks (singleLineFolds=false reproduces tsserver
+    // outlining spans) PLUS the intentional WebStorm differences (single-line
+    // closing-bracket behavior, comment runs, and other scanner extras).
+    // Same-start conflicts are resolved inside computeFoldingRanges by
+    // deterministic dedup/merging, never by provider registration order.
     const provider: vscode.FoldingRangeProvider = {
         onDidChangeFoldingRanges: foldingRangesChanged.event,
         provideFoldingRanges(document) {
@@ -761,7 +1065,13 @@ export function activate(context: vscode.ExtensionContext): void {
                     new vscode.FoldingRange(
                         r.start,
                         r.end,
-                        r.kind === 'comment' ? vscode.FoldingRangeKind.Comment : undefined
+                        r.kind === 'comment'
+                            ? vscode.FoldingRangeKind.Comment
+                            : r.kind === 'region'
+                              ? vscode.FoldingRangeKind.Region
+                              : r.kind === 'imports'
+                                ? vscode.FoldingRangeKind.Imports
+                                : undefined
                     )
             );
         },
@@ -771,7 +1081,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const registerProvider = () => {
         providerRegistration?.dispose();
         providerRegistration = undefined;
-        const languages = cfg().get<string[]>('languages', []);
+        // F-13: languages with unmodeled multiline literals (C/C++/C#/Java/PHP)
+        // keep NATIVE folding — do not register our provider for them at all.
+        const languages = takeoverLanguages(cfg().get<string[]>('languages', []));
         if (languages.length > 0) {
             providerRegistration = vscode.languages.registerFoldingRangeProvider(
                 languages,
@@ -780,34 +1092,21 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     };
 
-    let reRegisterTimer: NodeJS.Timeout;
-    const scheduleReRegister = () => {
-        clearTimeout(reRegisterTimer);
-        const delay = Math.max(0, cfg().get<number>('providerDelay', 2000));
-        reRegisterTimer = setTimeout(registerProvider, delay);
-    };
-
     registerProvider();
-    scheduleReRegister();
     context.subscriptions.push(
         {
             dispose: () => {
-                clearTimeout(reRegisterTimer);
                 providerRegistration?.dispose();
             },
-        },
-        vscode.workspace.onDidOpenTextDocument(document => {
-            const languages = cfg().get<string[]>('languages', []);
-            if (languages.includes(document.languageId)) scheduleReRegister();
-        })
+        }
     );
 
-    // The bullet-proof route (VS Code ≥1.73): `editor.defaultFoldingRangeProvider`
-    // makes this extension the ONLY folding source, so folds are guaranteed to
-    // look like WebStorm (single-line, params visible). Applied automatically —
-    // the old one-time prompt was too easy to dismiss, which left the built-in
-    // provider in charge and made folding look non-WebStorm.
-    void ensureDefaultFoldingProvider();
+    // The takeover route (VS Code ≥1.73): `editor.defaultFoldingRangeProvider`
+    // makes this extension the ONLY folding source for the configured
+    // languages, so folds are guaranteed to look like WebStorm (single-line).
+    // The provider returns the unified native-equivalent + Smart model, so no
+    // second provider is needed for correctness.
+    void ensureDefaultFoldingProvider(context);
 }
 
 /**
@@ -817,37 +1116,141 @@ export function activate(context: vscode.ExtensionContext): void {
  * - take-over ON  + setting unset            → point it at this extension.
  * - take-over ON  + user chose ANOTHER one   → respect the user's choice.
  * - take-over OFF + setting points at us     → clear it back to the default.
+ *
+ * F-13: languages with unmodeled multiline literals are filtered OUT — native
+ * folding remains active for them.
+ *
+ * E-11: cleanup is ownership-aware (only values that point at THIS extension
+ * are touched — never a newer user change). E-12: the whole operation is
+ * failure-tolerant (read-only profiles, remote scenarios).
  */
-async function ensureDefaultFoldingProvider(): Promise<void> {
-    const takeOver = vscode.workspace
-        .getConfiguration('smartFolding')
-        .get<boolean>('takeOverFolding', true);
-    const editorCfg = vscode.workspace.getConfiguration('editor');
-    let current = editorCfg.get<string>('defaultFoldingRangeProvider');
+/**
+ * F-E: extension IDs compare case-insensitively in VS Code (a user can type
+ * `seymi.smart-folding` and it still selects this extension), so ownership
+ * checks must ignore case — a strict compare left such overrides behind.
+ */
+function isOurProviderId(id: string | undefined): boolean {
+    return id !== undefined && id.toLowerCase() === EXTENSION_ID.toLowerCase();
+}
 
-    if (takeOver) {
-        if (!current) {
-            await editorCfg.update(
+async function ensureDefaultFoldingProvider(context?: vscode.ExtensionContext): Promise<void> {
+    try {
+        const c = vscode.workspace.getConfiguration('smartFolding');
+        const takeOver = c.get<boolean>('takeOverFolding', true);
+        const languages = takeoverLanguages(c.get<string[]>('languages', []));
+
+        // Clean up any legacy global override set by previous versions
+        const globalEditorCfg = vscode.workspace.getConfiguration('editor');
+        if (isOurProviderId(globalEditorCfg.get<string>('defaultFoldingRangeProvider'))) {
+            await globalEditorCfg.update(
                 'defaultFoldingRangeProvider',
-                EXTENSION_ID,
+                undefined,
                 vscode.ConfigurationTarget.Global
             );
-            void vscode.window.showInformationMessage(
-                'Smart Folding is now the default folding provider, so folds are ' +
-                    'single-line with parameters kept visible (WebStorm style). Disable ' +
-                    "'smartFolding.takeOverFolding' to undo this."
-            );
         }
-    } else if (current === EXTENSION_ID) {
-        await editorCfg.update(
-            'defaultFoldingRangeProvider',
-            undefined,
-            vscode.ConfigurationTarget.Global
-        );
+
+        // Apply or remove language-scoped overrides. `inspect` distinguishes an
+        // explicit user override from an inherited default: only write when no
+        // explicit value exists, and only clear what this extension set.
+        for (const lang of languages) {
+            const langCfg = vscode.workspace.getConfiguration('editor', { languageId: lang });
+            const inspected = langCfg.inspect<string>('defaultFoldingRangeProvider');
+            // Language-scoped writes land in `[lang]` sections, which `inspect`
+            // reports via the *LanguageValue fields — `globalValue` stays
+            // undefined for them, so it must not be consulted first.
+            const explicit =
+                inspected?.globalLanguageValue ??
+                inspected?.workspaceLanguageValue ??
+                inspected?.workspaceFolderLanguageValue ??
+                inspected?.globalValue ??
+                inspected?.workspaceValue ??
+                inspected?.workspaceFolderValue;
+
+            if (takeOver) {
+                if (!explicit) {
+                    await langCfg.update(
+                        'defaultFoldingRangeProvider',
+                        EXTENSION_ID,
+                        vscode.ConfigurationTarget.Global,
+                        true
+                    );
+                }
+            } else if (isOurProviderId(explicit)) {
+                await langCfg.update(
+                    'defaultFoldingRangeProvider',
+                    undefined,
+                    vscode.ConfigurationTarget.Global,
+                    true
+                );
+            }
+        }
+
+        // Orphan cleanup: a language removed from `smartFolding.languages` keeps
+        // a `[lang]` override in settings.json unless it is cleared. Track every
+        // language this extension ever configured and clear entries that are no
+        // longer wanted.
+        if (context) {
+            const key = 'smartFolding.configuredTakeOverLanguages';
+            const previous = context.globalState.get<string[]>(key, []);
+            const wanted = new Set<string>(takeOver ? languages : []);
+            for (const lang of previous) {
+                if (!wanted.has(lang)) {
+                    const langCfg = vscode.workspace.getConfiguration('editor', {
+                        languageId: lang,
+                    });
+                    const inspected = langCfg.inspect<string>('defaultFoldingRangeProvider');
+                    const explicit =
+                        inspected?.globalLanguageValue ??
+                        inspected?.workspaceLanguageValue ??
+                        inspected?.workspaceFolderLanguageValue ??
+                        inspected?.globalValue ??
+                        inspected?.workspaceValue ??
+                        inspected?.workspaceFolderValue;
+                    if (isOurProviderId(explicit)) {
+                        await langCfg.update(
+                            'defaultFoldingRangeProvider',
+                            undefined,
+                            vscode.ConfigurationTarget.Global,
+                            true
+                        );
+                    }
+                }
+            }
+            await context.globalState.update(key, takeOver ? languages : []);
+        }
+    } catch {
+        // E-12: read-only profiles / remote scenarios — degrade gracefully.
     }
 }
 
-export function deactivate(): void {}
+export function deactivate(): Thenable<void> | void {
+    // E-11: best-effort cleanup of the transparent placeholder color this
+    // extension wrote into GLOBAL settings. Ownership-aware: only our own
+    // transparent value is removed — a user-modified value is left untouched.
+    // (Language-scoped defaultFoldingRangeProvider entries are cleaned up on
+    // the next activation; the extension host may not survive awaiting
+    // settings writes during uninstall.)
+    if (!ownedPlaceholderColor) {
+        return;
+    }
+    try {
+        const workbench = vscode.workspace.getConfiguration('workbench');
+        const inspected = workbench.inspect<Record<string, unknown>>('colorCustomizations');
+        const colors = inspected?.globalValue;
+        if (colors && colors[PLACEHOLDER_COLOR] === TRANSPARENT_COLOR) {
+            const next: Record<string, unknown> = { ...colors };
+            delete next[PLACEHOLDER_COLOR];
+            return workbench
+                .update('colorCustomizations', next, vscode.ConfigurationTarget.Global)
+                .then(
+                    () => undefined,
+                    () => undefined
+                );
+        }
+    } catch {
+        // Best effort only.
+    }
+}
 
 /**
  * Collapsed folds for the editor, bridged over the viewport's bottom edge.
@@ -856,13 +1259,12 @@ export function deactivate(): void {}
  * scrolled into view. While a fold's header sits at the very BOTTOM of the
  * viewport, a collapsed fold and the viewport simply ending look identical —
  * so the badge used to vanish mid-scroll and the hidden `{` popped back in.
- * Folds are therefore remembered per document while collapsed and trusted
- * again exactly in that ambiguous bottom-edge case. A remembered fold is
- * forgotten as soon as any of its hidden lines is actually rendered (i.e. it
- * was opened) or the document changes.
+ * Folds are therefore remembered per editor while collapsed and trusted again
+ * exactly in that ambiguous bottom-edge case (E-2: the memory is per editor,
+ * not per document URI). A remembered fold is forgotten as soon as any of its
+ * hidden lines is actually rendered (i.e. it was opened) or the document
+ * changes.
  */
-const rememberedFolds = new Map<string, { version: number; folds: CollapsedFold[] }>();
-
 function currentCollapsedFolds(
     editor: vscode.TextEditor,
     ranges: SimpleFoldingRange[]
@@ -871,10 +1273,10 @@ function currentCollapsedFolds(
         startLine: r.start.line,
         endLine: r.end.line,
     }));
-    const detected = collapsedFolds(visible, ranges);
-    const key = editor.document.uri.toString();
+    const detected = collapsedFolds(visible, ranges, editor.document.lineCount);
+    const m = mem(editor);
     const version = editor.document.version;
-    const prev = rememberedFolds.get(key);
+    const prev = m.rememberedFolds;
     const remembered = prev && prev.version === version ? prev.folds : [];
 
     const hiddenRegionRendered = (f: CollapsedFold): boolean =>
@@ -890,7 +1292,7 @@ function currentCollapsedFolds(
     }
     folds.sort((a, b) => a.header - b.header);
 
-    rememberedFolds.set(key, { version, folds: [...detected, ...kept] });
+    m.rememberedFolds = { version, folds: [...detected, ...kept] };
     return folds;
 }
 
@@ -899,7 +1301,8 @@ function currentCollapsedFolds(
  * the column from which the header line's own text is visually hidden so the
  * badge can take its place (undefined = nothing hidden, the badge simply
  * follows the line end). Shared by the renderer and the click handler so the
- * clickable area always matches what is drawn.
+ * clickable area always matches what is drawn. T-5: the decision logic lives
+ * in core (`computeFoldBadge`) and is unit-tested.
  */
 function foldBadge(
     editor: vscode.TextEditor,
@@ -907,120 +1310,40 @@ function foldBadge(
     ranges: SimpleFoldingRange[],
     c: vscode.WorkspaceConfiguration,
     hiddenEnd?: number
-): { contentText: string; hiddenStart?: number; visibleMarkerEnd?: number } {
-    const lineText = editor.document.lineAt(line).text;
+): { contentText: string; hiddenStart?: number; visibleMarkerEnd?: number; noMargin?: boolean } {
     // The range matching the ACTUALLY hidden region decides how the collapsed
     // block is rendered. Requiring the exact end line keeps the fancy badges
     // honest: when the active fold came from another folding provider and
-    // hides a DIFFERENT region than our range (e.g. a comment fold that
-    // leaves its closing `*/` visible), pretending it was ours painted the
-    // ellipsis in the wrong place. Such folds now get the plain badge.
+    // hides a DIFFERENT region than our range, pretending it was ours painted
+    // the ellipsis in the wrong place. Such folds get the plain badge.
     const range = ranges.find(
         r => r.start === line && (hiddenEnd === undefined || r.end === hiddenEnd)
     );
+    if (!range) return { contentText: ' ··· ' };
 
-    if (range?.kind === 'comment' && c.get<boolean>('commentPreview', true)) {
-        // WebStorm-style readable comment folds: the WHOLE comment — its
-        // `/**` header included — collapses into the gray badge, which shows
-        // the first meaningful text line:  /** Folding ranges per document… */
+    let previewText = '';
+    if (range.kind === 'comment' && c.get<boolean>('commentPreview', true)) {
         const previewLength = Math.max(4, c.get<number>('commentPreviewLength', 60));
         const commentLines: string[] = [];
         const lastLine = Math.min(range.end, editor.document.lineCount - 1);
         for (let l = range.start; l <= lastLine; l++) {
             commentLines.push(editor.document.lineAt(l).text);
         }
-        const preview = commentPreviewText(commentLines, previewLength);
-        const trimmed = lineText.trimStart();
-        if (trimmed.startsWith('//')) {
-            const markerIndex = lineText.indexOf('//');
-            // VS Code does not expose click events for decorations; click-to-
-            // expand is inferred from the caret position produced by a mouse
-            // click. An `after` decoration anchored at absolute column 0 is a
-            // special dead zone: depending on font/layout, clicking it may not
-            // move the caret (or may not emit a selection event at all). Keep
-            // the real top-level `//` as a tiny, stable text boundary and hide
-            // everything after it. The gray preview is then anchored at column
-            // 2, where VS Code reliably produces a mouse selection event.
-            if (markerIndex === 0) {
-                // When the header line is ONLY the marker, the first hidden
-                // column coincides with the LINE END — the exact position where
-                // other extensions (e.g. GitLens inline blame) anchor their own
-                // end-of-line `after` decorations. VS Code offers no cross-
-                // extension ordering for decorations at the SAME position, so
-                // blame can squeeze in BEFORE the badge. Hiding the marker's
-                // last char and re-drawing it inside the badge pulls the anchor
-                // strictly before the line end — position order then guarantees
-                // the badge always renders first.
-                if (lineText.length === 2) {
-                    return {
-                        contentText: `/ ${preview} ···`,
-                        hiddenStart: 1,
-                        visibleMarkerEnd: 1,
-                    };
-                }
-                return {
-                    contentText: ` ${preview} ···`,
-                    hiddenStart: 2,
-                    visibleMarkerEnd: 2,
-                };
-            }
-            return { contentText: `// ${preview} ···`, hiddenStart: lineText.indexOf('//') };
-        }
-        const marker = trimmed.match(/\/\*+/)?.[0] ?? '/*';
-        const markerIndex = lineText.indexOf(marker);
-        // Same column-zero rule as `//` above. Retaining only the real marker
-        // is intentionally preferable to parking the cursor on another line:
-        // cross-line parking interferes with cursor-restore state, while a
-        // real text boundary makes every click on the injected preview change
-        // the selection without touching restore logic at all.
-        if (markerIndex === 0) {
-            // Same line-end tie-break as `//` above: on a bare `/**` header
-            // line, anchoring at `marker.length` lands exactly ON the line
-            // end, where GitLens & co. attach their inline blame — rendering
-            // order between extensions at identical positions is undefined.
-            // Hide the marker's last char and re-draw it inside the badge so
-            // the anchor sits strictly before the line end and the badge
-            // deterministically renders before any end-of-line decoration.
-            if (lineText.length === marker.length) {
-                return {
-                    contentText: `${marker.charAt(marker.length - 1)} ${preview} */`,
-                    hiddenStart: marker.length - 1,
-                    visibleMarkerEnd: marker.length - 1,
-                };
-            }
-            return {
-                contentText: ` ${preview} */`,
-                hiddenStart: marker.length,
-                visibleMarkerEnd: marker.length,
-            };
-        }
-        return {
-            contentText: `${marker} ${preview} */`,
-            hiddenStart: markerIndex >= 0 ? markerIndex : undefined,
-        };
+        previewText = commentPreviewText(commentLines, previewLength);
     }
-
-    // hideOpeningBracket only applies with single-line folds: when
-    // singleLineFolding is OFF the closing bracket stays visible on its own
-    // line below, so a `{...}` badge would lie — fall through to the plain
-    // ` ··· ` badge and leave the opening bracket visible.
-    if (
-        range?.kind !== 'comment' &&
-        c.get<boolean>('singleLineFolding', true) &&
-        c.get<boolean>('hideOpeningBracket', true)
-    ) {
-        // Render `function foo() {...}`: the real opening bracket is
-        // visually hidden and the badge takes its place.
-        const trimmed = lineText.trimEnd();
-        const lastChar = trimmed.charAt(trimmed.length - 1);
-        const closer =
-            lastChar === '{' ? '}' : lastChar === '[' ? ']' : lastChar === '(' ? ')' : undefined;
-        if (closer) {
-            return { contentText: `${lastChar}...${closer}`, hiddenStart: trimmed.length - 1 };
-        }
+    let closingLineText: string | undefined;
+    if (hiddenEnd !== undefined && hiddenEnd > line && hiddenEnd < editor.document.lineCount) {
+        closingLineText = editor.document.lineAt(hiddenEnd).text;
     }
-
-    return { contentText: ' ··· ' };
+    return computeFoldBadge({
+        lineText: editor.document.lineAt(line).text,
+        kind: range.kind,
+        previewText,
+        commentPreviewEnabled: c.get<boolean>('commentPreview', true),
+        singleLineFolding: c.get<boolean>('singleLineFolding', true),
+        hideOpeningBracket: c.get<boolean>('hideOpeningBracket', true),
+        closingLineText,
+    });
 }
 
 function updateEllipsisDecorations(editor: vscode.TextEditor, enabled: boolean): void {
@@ -1041,7 +1364,7 @@ function updateEllipsisDecorations(editor: vscode.TextEditor, enabled: boolean):
     const hiddenRanges: vscode.Range[] = [];
     for (const { header: line, hiddenEnd } of folds) {
         const end = editor.document.lineAt(line).range.end;
-        const { contentText, hiddenStart, visibleMarkerEnd } = foldBadge(
+        const { contentText, hiddenStart, visibleMarkerEnd, noMargin } = foldBadge(
             editor,
             line,
             ranges,
@@ -1061,14 +1384,14 @@ function updateEllipsisDecorations(editor: vscode.TextEditor, enabled: boolean):
         }
 
         const hover = new vscode.MarkdownString(
-            `[$(unfold)\u00a0Expand](command:smartFolding.expandHere?${encodeURIComponent(
+            `[$(unfold) Expand](command:smartFolding.expandHere?${encodeURIComponent(
                 JSON.stringify([line])
             )} "Expand this folded block")`
         );
         hover.isTrusted = true;
         // Anchoring the badge at the first HIDDEN column (instead of the
         // line end) keeps it flush after the visible code and makes it render
-        // BEFORE other extensions' end-of-line decorations \u2014 e.g. GitLens
+        // BEFORE other extensions' end-of-line decorations — e.g. GitLens
         // inline blame no longer squeezes in before the {...} badge.
         // The anchor must sit exactly at the START boundary of the hidden
         // span: anchoring strictly INSIDE it (e.g. column 1 of a fully
@@ -1080,10 +1403,10 @@ function updateEllipsisDecorations(editor: vscode.TextEditor, enabled: boolean):
         badges.push({
             range: new vscode.Range(anchor, anchor),
             hoverMessage: hover,
-            renderOptions: {
-                after:
-                    visibleMarkerEnd !== undefined
-                        ? {
+            renderOptions:
+                visibleMarkerEnd !== undefined
+                    ? {
+                          after: {
                               contentText,
                               // Join the injected preview to the decorated real
                               // marker. It remains two rendering primitives only
@@ -1091,9 +1414,15 @@ function updateEllipsisDecorations(editor: vscode.TextEditor, enabled: boolean):
                               margin: '0',
                               textDecoration:
                                   'none; border-radius: 0 4px 4px 0; padding: 0 5px 0 0; cursor: pointer;',
-                          }
-                        : { contentText },
-            },
+                          },
+                      }
+                    : hiddenStart !== undefined
+                      ? {
+                            after: noMargin ? { contentText, margin: '0' } : { contentText },
+                        }
+                      : {
+                            before: { contentText },
+                        },
         });
     }
 
@@ -1140,8 +1469,8 @@ async function smartUnfold(
     editor: vscode.TextEditor,
     fallbackCommand: 'editor.unfold' | 'editor.unfoldRecursively' = 'editor.unfold'
 ): Promise<void> {
-    const key = editor.document.uri.toString();
-    const state = savedStates.get(key);
+    const m = mem(editor);
+    const state = liveState(editor);
 
     const selections = state?.selections ?? cloneSelections(editor.selections);
     if (selections.length === 0) {
@@ -1201,7 +1530,7 @@ async function smartUnfold(
     }
 
     // Only consume the remembered cursor once it was successfully restored.
-    if (restored) savedStates.delete(key);
+    if (restored) m.savedState = undefined;
 
     restoreView(editor, selections);
 }

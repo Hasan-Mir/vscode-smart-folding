@@ -1,0 +1,11 @@
+src/**
+fixtures/**
+scripts/**
+out/test/**
+out/integration/**
+.gitignore
+.prettierrc
+tsconfig.json
+**/*.vsix
+**/*.map
+node_modules/**

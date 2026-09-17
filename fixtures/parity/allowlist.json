@@ -1,0 +1,78 @@
+{
+    "kitchen-sink.ts": [
+        {
+            "start": 0,
+            "end": 1,
+            "kind": "comment",
+            "reason": "Intentional WebStorm extra: the two-line // header comment run folds."
+        },
+        {
+            "start": 56,
+            "end": 58,
+            "kind": "comment",
+            "reason": "Intentional WebStorm extra: runs of consecutive whole-line // comments fold (tsserver emits no line-comment-run span)."
+        }
+    ],
+    "jsx-kitchen-sink.tsx": [
+        {
+            "start": 0,
+            "end": 1,
+            "kind": "comment",
+            "reason": "Intentional WebStorm extra: the two-line // header comment run folds."
+        }
+    ],
+    "allman.ts": [],
+    "allman-blocks.ts": [],
+    "allman-signatures.ts": [],
+    "imports-asi.ts": [],
+    "imports-comment-gap.ts": [],
+    "imports-dynamic.ts": [],
+    "multiline-switch.ts": [],
+    "stray-closer.ts": [],
+    "multiline-imports.ts": [],
+    "crlf.ts": [],
+    "plain.js": [],
+    "switch-header-comment.ts": [],
+    "complex-generics-and-nesting.ts": [
+        {
+            "start": 11,
+            "end": 12,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        },
+        {
+            "start": 16,
+            "end": 17,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        },
+        {
+            "start": 29,
+            "end": 30,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        },
+        {
+            "start": 34,
+            "end": 35,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        },
+        {
+            "start": 39,
+            "end": 40,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        },
+        {
+            "start": 70,
+            "end": 71,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        },
+        {
+            "start": 76,
+            "end": 81,
+            "reason": "Intentional WebStorm extra: mapped type alias body {...} folds."
+        },
+        {
+            "start": 78,
+            "end": 79,
+            "reason": "Intentional WebStorm extra: mapped type literal {...} folds in conditional generic."
+        }
+    ]
+}

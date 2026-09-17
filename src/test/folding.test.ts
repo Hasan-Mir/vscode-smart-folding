@@ -1,21 +1,26 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+    addedCursorIndex,
     collapsedFoldHeaderForHiddenLine,
-    collapsedFoldStarts,
     collapsedFolds,
+    collapsedFoldStarts,
     commentPreviewText,
+    computeFoldBadge,
     computeFoldingRanges,
     foldedStartLines,
     isLikelyFoldClamp,
+    lineHiddenByFold,
     revealedGapContainingLine,
     SimpleFoldingRange,
+    TAKEOVER_EXCLUDED_LANGUAGES,
+    takeoverLanguages,
     unfoldPathForLine,
     unfoldRevealedGapLines,
 } from '../core/folding';
 
-const WEBSTORM = { singleLineFolds: true, keepFunctionParamsVisible: true };
-const VSCODE_LIKE = { singleLineFolds: false, keepFunctionParamsVisible: false };
+const WEBSTORM = { singleLineFolds: true };
+const VSCODE_LIKE = { singleLineFolds: false };
 
 function byStart(ranges: SimpleFoldingRange[], start: number): SimpleFoldingRange | undefined {
     return ranges.find(r => r.start === start);
@@ -41,7 +46,7 @@ test('single-line blocks produce no folding range', () => {
     assert.deepEqual(computeFoldingRanges('const x = { a: 1 };', WEBSTORM), []);
 });
 
-test('keepFunctionParamsVisible=true: multi-line parameter lists are NOT foldable', () => {
+test('parenthesized signature groups merge with the body (no dangling header)', () => {
     const code = [
         'const Comp = React.memo<Props>((', // 0
         '  props: Props,', // 1
@@ -52,17 +57,23 @@ test('keepFunctionParamsVisible=true: multi-line parameter lists are NOT foldabl
     ].join('\n');
 
     const webstorm = computeFoldingRanges(code, WEBSTORM);
-    // The params `(` opened on line 0 must NOT create a fold…
-    assert.equal(byStart(webstorm, 0), undefined);
-    // …but the body `{` on line 3 must (single line, includes `});` line).
+    // The inner params `(` closes on `) => {` (a line that opens the body),
+    // so its range stretches through the body end — Fold All collapses the
+    // whole signature+body instead of leaving a dangling `) => {` line…
+    assert.ok(
+        webstorm.some(r => r.start === 0 && r.end === 5),
+        'signature paren should stretch through the body'
+    );
+    // T-2: was a byte-identical duplicate of the assertion above — now it
+    // actually tests the distinct behavior: the body `{` keeps its own
+    // progressive fold (single line, includes the `});` line).
     assert.deepEqual(byStart(webstorm, 3), { start: 3, end: 5 });
-
-    // When the option is off, the parameter list IS foldable.
-    const permissive = computeFoldingRanges(code, {
-        ...WEBSTORM,
-        keepFunctionParamsVisible: false,
-    });
-    assert.ok(byStart(permissive, 0), 'param list should fold when option disabled');
+    // The OUTER `React.memo(` paren is a call-argument group — it covers the
+    // whole call on its own.
+    assert.ok(
+        webstorm.some(r => r.start === 0 && r.end === 5),
+        'call-argument paren group should fold'
+    );
 });
 
 test('nested blocks each get their own range', () => {
@@ -115,25 +126,26 @@ test('arrays fold too', () => {
     assert.deepEqual(computeFoldingRanges(code, WEBSTORM), [{ start: 0, end: 3 }]);
 });
 
-test('unbalanced input does not throw and yields sane ranges', () => {
-    const code = ['function broken() {', '  if (x) {', '}'].join('\n');
-    assert.doesNotThrow(() => computeFoldingRanges(code, WEBSTORM));
+test('unbalanced input does not throw and yields sane ranges (T-4)', () => {
+    // T-4: replaces a bare doesNotThrow with a meaningful assertion — the
+    // unclosed block simply produces no range at all.
+    const code = ['function broken() {', '  if (x) {'].join('\n');
+    assert.deepEqual(computeFoldingRanges(code, WEBSTORM), []);
 });
 
 test('VSCODE_LIKE options combined behave like the defaults of VS Code', () => {
     const code = ['call((', '  a,', ') => {', '  b();', '});'].join('\n');
     const ranges = computeFoldingRanges(code, VSCODE_LIKE);
-    // Closing lines are excluded everywhere, and BOTH paren groups fold:
-    // the outer `call(` spanning to `);` and the inner parameter list.
-    assert.ok(
-        ranges.some(r => r.start === 0 && r.end === 3),
-        'outer call( ... ) should fold, excluding its closing line'
+    // Verified against tsserver's getOutliningSpans (what VS Code really
+    // shows): the arrow function with a multi-line parameter list folds
+    // from its `(` through the body as ONE region, the outer call parens
+    // cover the same lines, and everything deduplicates to a single range
+    // that keeps the closing `});` line visible. There is no separate
+    // parameter-list or body range in native mode.
+    assert.deepEqual(
+        ranges.map(r => ({ start: r.start, end: r.end })),
+        [{ start: 0, end: 3 }]
     );
-    assert.ok(
-        ranges.some(r => r.start === 0 && r.end === 1),
-        'inner parameter list should fold when the option is disabled'
-    );
-    assert.deepEqual(byStart(ranges, 2), { start: 2, end: 3 });
 });
 
 test('foldedStartLines: every boundary between visible ranges marks a folded line', () => {
@@ -224,8 +236,6 @@ test('resolveEllipsisBackground: empty/whitespace/missing → undefined (fall ba
 
 // --- Pre-fold cursor tracker: lineHiddenByFold -------------------------------
 
-import { lineHiddenByFold } from '../core/folding';
-
 test('lineHiddenByFold: lines in the gap between visible ranges are fold-hidden', () => {
     // Lines 5..9 are folded away between two visible ranges.
     const visible = [
@@ -279,6 +289,77 @@ test('isLikelyFoldClamp: detects finally-block cursor clamped to function header
 test('isLikelyFoldClamp: rejects ordinary upward cursor movement', () => {
     assert.equal(isLikelyFoldClamp(WS_RANGES, 9, 7), false);
     assert.equal(isLikelyFoldClamp(WS_RANGES, 3, 3), false);
+});
+
+test('isLikelyFoldClamp alone is not proof of a fold clamp: Go to Definition to a header must not arm state', () => {
+    const ranges = computeFoldingRanges(FUNC, WEBSTORM);
+    // isLikelyFoldClamp is structural only — the extension also requires the
+    // previous line to be fold-hidden (or the range to reach EOF), so a plain
+    // programmatic jump to a range header never arms saved fold state.
+    assert.equal(isLikelyFoldClamp(ranges, 1, 0), true);
+    assert.equal(lineHiddenByFold([{ startLine: 0, endLine: 2 }], 1), false);
+});
+
+// --- Unified provider model: native-equivalent + Smart in one result --------
+
+test('unified model: native-only mapped-type fold and Smart function fold coexist', () => {
+    const code = [
+        'export type EntityPatch<T> = {', // 0
+        '    [K in keyof T]?: T[K];', // 1
+        '};', // 2
+        'function foo() {', // 3
+        '    return 1;', // 4
+        '}', // 5
+    ].join('\n');
+    const smart = computeFoldingRanges(code, { ...WEBSTORM, languageId: 'typescript' });
+    assert.ok(smart.some(r => r.start === 0 && r.end === 2), 'native-equivalent type fold survives');
+    assert.ok(smart.some(r => r.start === 3 && r.end === 5), 'Smart single-line function fold survives');
+});
+
+test('unified model: same-start paren/body conflict resolves to exactly one range (smart end)', () => {
+    const code = [
+        'export function make(', // 0
+        '    name: string', // 1
+        ')', // 2
+        '{', // 3
+        '    return name;', // 4
+        '}', // 5
+    ].join('\n');
+    const smart = computeFoldingRanges(code, {
+        singleLineFolds: true,
+        foldComments: true,
+        languageId: 'typescript',
+    });
+    const sameStart = smart.filter(r => r.start === 0 && r.kind === undefined);
+    assert.equal(sameStart.length, 1);
+    assert.equal(sameStart[0].end, 5);
+    const nativeStyle = computeFoldingRanges(code, {
+        singleLineFolds: false,
+        foldComments: true,
+        languageId: 'typescript',
+    });
+    assert.ok(
+        nativeStyle.some(r => r.start === 0 && r.end === 4),
+        'VS Code-style model keeps the closing brace visible'
+    );
+});
+
+test('unified model: overlapping ranges keep every nested fold', () => {
+    const code = [
+        'function outer() {', // 0
+        '    if (true) {', // 1
+        '        work();', // 2
+        '    }', // 3
+        '}', // 4
+    ].join('\n');
+    const smart = computeFoldingRanges(code, WEBSTORM);
+    assert.ok(smart.some(r => r.start === 0 && r.end === 4), 'outer fold survives');
+    assert.ok(smart.some(r => r.start === 1 && r.end === 3), 'nested fold survives');
+});
+
+test('unified model: excluded languages stay native-only (no Smart provider ranges forced)', () => {
+    assert.ok(TAKEOVER_EXCLUDED_LANGUAGES.has('cpp'));
+    assert.deepEqual(takeoverLanguages(['cpp', 'typescript']), ['typescript']);
 });
 
 test('unfoldRevealedGapLines: Unfold All reveals previously fold-hidden lines in place', () => {
@@ -354,7 +435,6 @@ test('computeFoldingRanges: multi-line JSDoc folds as a comment range', () => {
     const text = ['/**', ' * Docs here.', ' */', 'function a() {', '    return 1;', '}'].join('\n');
     const ranges = computeFoldingRanges(text, {
         singleLineFolds: true,
-        keepFunctionParamsVisible: true,
         foldComments: true,
     });
     assert.deepEqual(ranges[0], { start: 0, end: 2, kind: 'comment' });
@@ -364,7 +444,6 @@ test('computeFoldingRanges: single-line block comments never fold', () => {
     const text = ['/* one liner */', '/** also one line */', 'const x = 1;'].join('\n');
     const ranges = computeFoldingRanges(text, {
         singleLineFolds: true,
-        keepFunctionParamsVisible: true,
         foldComments: true,
     });
     assert.equal(ranges.length, 0);
@@ -399,7 +478,7 @@ test('collapsedFoldStarts: a gap between visible ranges is a collapsed fold', ()
         { startLine: 0, endLine: 5 },
         { startLine: 10, endLine: 20 },
     ];
-    assert.deepEqual(collapsedFoldStarts(visible, []), [5]);
+    assert.deepEqual(collapsedFoldStarts(visible, [], 100), [5]);
 });
 
 test('collapsedFoldStarts: a fold reaching EOF is recovered from the ranges', () => {
@@ -408,13 +487,26 @@ test('collapsedFoldStarts: a fold reaching EOF is recovered from the ranges', ()
         { startLine: 10, endLine: 12 },
     ];
     const ranges: SimpleFoldingRange[] = [{ start: 12, end: 40 }];
-    assert.deepEqual(collapsedFoldStarts(visible, ranges), [5, 12]);
+    assert.deepEqual(collapsedFoldStarts(visible, ranges, 41), [5, 12]);
 });
 
-test('collapsedFoldStarts: the EOF case is not trusted with a single visible range', () => {
+test('collapsedFoldStarts: the EOF case is trusted with a single visible range at EOF', () => {
     const visible = [{ startLine: 0, endLine: 12 }];
     const ranges: SimpleFoldingRange[] = [{ start: 12, end: 40 }];
-    assert.deepEqual(collapsedFoldStarts(visible, ranges), []);
+    assert.deepEqual(collapsedFoldStarts(visible, ranges, 41), [12]);
+});
+
+// E-7: the EOF/bottom-edge heuristic must require the range to REACH EOF.
+test('collapsedFoldStarts: an open block at the viewport bottom is NOT a fold (E-7)', () => {
+    // Two visible ranges (folding active) and a range starting on the last
+    // visible line — but it does NOT reach EOF: the old heuristic fabricated
+    // a phantom collapsed fold here.
+    const visible = [
+        { startLine: 0, endLine: 5 },
+        { startLine: 10, endLine: 12 },
+    ];
+    const ranges: SimpleFoldingRange[] = [{ start: 12, end: 40 }];
+    assert.deepEqual(collapsedFoldStarts(visible, ranges, 100), [5]);
 });
 
 // --- line-comment runs ---------------------------------------------------------
@@ -423,7 +515,6 @@ test('computeFoldingRanges: consecutive // line comments fold as one comment blo
     const text = ['// one', '// two', '// three', 'const x = 1;'].join('\n');
     const ranges = computeFoldingRanges(text, {
         singleLineFolds: true,
-        keepFunctionParamsVisible: true,
         foldComments: true,
     });
     assert.deepEqual(ranges[0], { start: 0, end: 2, kind: 'comment' });
@@ -433,7 +524,6 @@ test('computeFoldingRanges: a lone // line comment never folds', () => {
     const text = ['// alone', 'const x = 1;', '// another alone', 'const y = 2;'].join('\n');
     const ranges = computeFoldingRanges(text, {
         singleLineFolds: true,
-        keepFunctionParamsVisible: true,
         foldComments: true,
     });
     assert.equal(ranges.length, 0);
@@ -443,7 +533,6 @@ test('computeFoldingRanges: trailing // comments after code are not comment line
     const text = ['const a = 1; // one', 'const b = 2; // two', '// three'].join('\n');
     const ranges = computeFoldingRanges(text, {
         singleLineFolds: true,
-        keepFunctionParamsVisible: true,
         foldComments: true,
     });
     assert.equal(ranges.length, 0);
@@ -493,7 +582,8 @@ test('collapsedFolds: derives header and hidden end from visible-range gaps', ()
             { startLine: 21, endLine: 40 },
             { startLine: 51, endLine: 60 },
         ],
-        []
+        [],
+        100
     );
     assert.deepEqual(folds, [
         { header: 10, hiddenEnd: 20 },
@@ -507,7 +597,8 @@ test('collapsedFolds: recovers a fold reaching EOF from the ranges list', () => 
             { startLine: 0, endLine: 10 },
             { startLine: 21, endLine: 30 },
         ],
-        [{ start: 30, end: 45 }]
+        [{ start: 30, end: 45 }],
+        46
     );
     assert.deepEqual(folds, [
         { header: 10, hiddenEnd: 20 },
@@ -515,36 +606,241 @@ test('collapsedFolds: recovers a fold reaching EOF from the ranges list', () => 
     ]);
 });
 
-test('collapsedFolds: does not trust the EOF heuristic with a single visible range', () => {
-    assert.deepEqual(collapsedFolds([{ startLine: 0, endLine: 30 }], [{ start: 30, end: 45 }]), []);
+test('collapsedFolds: trusts the EOF heuristic with a single visible range at EOF', () => {
+    assert.deepEqual(
+        collapsedFolds([{ startLine: 0, endLine: 30 }], [{ start: 30, end: 45 }], 46),
+        [{ header: 30, hiddenEnd: 45 }]
+    );
 });
 
-test('keepFunctionParamsVisible=false folds the whole signature+body as one region', () => {
-    const src = [
-        'async function smartUnfold(',
-        '    editor: TextEditor,',
-        '    fallback: string',
-        '): Promise<void> {',
-        '    await body();',
-        '}',
-    ].join('\n');
-    const merged = computeFoldingRanges(src, {
-        singleLineFolds: true,
-        keepFunctionParamsVisible: false,
-        foldComments: true,
-    });
-    // The parameter-list fold swallows the body opening on its `)` line…
-    assert.ok(merged.some(r => r.start === 0 && r.end === 5));
-    // …while the body block still folds on its own for progressive unfolding.
-    assert.ok(merged.some(r => r.start === 3 && r.end === 5));
-    // No dangling params-only fold remains.
-    assert.ok(!merged.some(r => r.start === 0 && r.end === 3));
+// E-7: EOF recovery requires the range to actually reach EOF.
+test('collapsedFolds: a range NOT reaching EOF is not recovered (E-7)', () => {
+    const folds = collapsedFolds(
+        [
+            { startLine: 0, endLine: 10 },
+            { startLine: 21, endLine: 30 },
+        ],
+        [{ start: 30, end: 45 }],
+        100
+    );
+    assert.deepEqual(folds, [{ header: 10, hiddenEnd: 20 }]);
+});
 
-    const kept = computeFoldingRanges(src, {
-        singleLineFolds: true,
-        keepFunctionParamsVisible: true,
-        foldComments: true,
+test('collapsedFolds: fold to the last brace is recovered with a single visible range', () => {
+    const folds = collapsedFolds([{ startLine: 0, endLine: 0 }], [{ start: 0, end: 4 }], 6);
+    assert.deepEqual(folds, [{ header: 0, hiddenEnd: 4 }]);
+});
+
+test('collapsedFolds: fold ending just before trailing empty lines is recovered', () => {
+    const folds = collapsedFolds([{ startLine: 0, endLine: 0 }], [{ start: 0, end: 4 }], 6);
+    assert.deepEqual(folds, [{ header: 0, hiddenEnd: 4 }]);
+});
+
+test('collapsedFoldStarts: single visible range at an EOF fold header is reported', () => {
+    assert.deepEqual(collapsedFoldStarts([{ startLine: 0, endLine: 0 }], [{ start: 0, end: 4 }], 6), [
+        0,
+    ]);
+});
+
+test('computeFoldBadge: multiline function declaration ending with ( renders {...} badge', () => {
+    const badge = computeFoldBadge({
+        lineText: 'export function processCommand<TData>(',
+        kind: undefined,
+        previewText: '',
+        commentPreviewEnabled: true,
+        singleLineFolding: true,
+        hideOpeningBracket: true,
+        closingLineText: '}',
     });
-    assert.ok(!kept.some(r => r.start === 0));
-    assert.ok(kept.some(r => r.start === 3 && r.end === 5));
+    assert.equal(badge.contentText, '{...}');
+    assert.equal(badge.hiddenStart, undefined);
+});
+
+test('collapsedFolds: EOF fold with a trailing newline still produces its badge range', () => {
+    const folds = collapsedFolds(
+        [
+            { startLine: 0, endLine: 0 },
+            { startLine: 5, endLine: 5 },
+        ],
+        [{ start: 0, end: 4 }],
+        6
+    );
+    assert.deepEqual(folds, [{ header: 0, hiddenEnd: 4 }]);
+});
+
+// --- E-8: addedCursorIndex ----------------------------------------------------
+
+test('addedCursorIndex: returns the index of the newly added cursor', () => {
+    const prev = [
+        { line: 3, character: 5 },
+        { line: 9, character: 0 },
+    ];
+    const next = [
+        { line: 3, character: 5 },
+        { line: 9, character: 0 },
+        { line: 20, character: 2 },
+    ];
+    assert.equal(addedCursorIndex(prev, next), 2);
+});
+
+test('addedCursorIndex: -1 only when every cursor pre-existed', () => {
+    const prev = [{ line: 3, character: 5 }];
+    assert.equal(addedCursorIndex(prev, [{ line: 3, character: 5 }]), -1);
+    assert.equal(addedCursorIndex([], []), -1);
+    // With 2+ selections, the cursor at a brand-new position is the added one
+    // (a modifier click adds a cursor rather than moving an existing one).
+    assert.equal(
+        addedCursorIndex(
+            [{ line: 9, character: 0 }],
+            [
+                { line: 9, character: 0 },
+                { line: 3, character: 5 },
+            ]
+        ),
+        1
+    );
+});
+
+// --- Copying collapsed blocks -------------------------------------------------
+
+import { extendCopyRange } from '../core/folding';
+
+const COPY_FOLDS = [
+    { header: 2, hiddenEnd: 5 },
+    { header: 10, hiddenEnd: 12 },
+];
+const COPY_LEN = (_line: number): number => 20;
+
+test('line copy (empty selection) on a collapsed header copies the whole block', () => {
+    const ext = extendCopyRange(
+        { startLine: 2, startCharacter: 7, endLine: 2, endCharacter: 7 },
+        COPY_FOLDS,
+        COPY_LEN
+    );
+    assert.deepEqual(ext, {
+        startLine: 2,
+        startCharacter: 0,
+        endLine: 5,
+        endCharacter: 20,
+        isLineCopy: true,
+    });
+});
+
+test('line copy on an ordinary line keeps the native copy', () => {
+    const ext = extendCopyRange(
+        { startLine: 7, startCharacter: 3, endLine: 7, endCharacter: 3 },
+        COPY_FOLDS,
+        COPY_LEN
+    );
+    assert.equal(ext, undefined);
+});
+
+test('a selection reaching the end of a collapsed row widens through the block', () => {
+    const ext = extendCopyRange(
+        { startLine: 2, startCharacter: 4, endLine: 2, endCharacter: 20 },
+        COPY_FOLDS,
+        COPY_LEN
+    );
+    assert.deepEqual(ext, {
+        startLine: 2,
+        startCharacter: 4,
+        endLine: 5,
+        endCharacter: 20,
+        isLineCopy: false,
+    });
+});
+
+test('a selection stopping before the visible end is NOT widened', () => {
+    const ext = extendCopyRange(
+        { startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 11 },
+        COPY_FOLDS,
+        COPY_LEN
+    );
+    assert.equal(ext, undefined);
+});
+
+test('a drag that stops at the badge (first hidden column) counts as line end', () => {
+    const visibleEnd = (line: number): number => (line === 2 ? 12 : 20);
+    const ext = extendCopyRange(
+        { startLine: 2, startCharacter: 0, endLine: 2, endCharacter: 12 },
+        COPY_FOLDS,
+        COPY_LEN,
+        visibleEnd
+    );
+    assert.deepEqual(ext, {
+        startLine: 2,
+        startCharacter: 0,
+        endLine: 5,
+        endCharacter: 20,
+        isLineCopy: false,
+    });
+});
+
+test('multi-line selections ending on ordinary lines keep the native copy', () => {
+    const ext = extendCopyRange(
+        { startLine: 0, startCharacter: 0, endLine: 8, endCharacter: 20 },
+        COPY_FOLDS,
+        COPY_LEN
+    );
+    assert.equal(ext, undefined);
+});
+
+// --- Signature fold tests ------------------------------------------------------
+
+test('async function signature parens merge with the body (no dangling header)', () => {
+    const code = [
+        'async function fetch(', // 0
+        '  url: string,', // 1
+        '  opts: RequestInit', // 2
+        '): Promise<Response> {', // 3
+        '  return fetch(url, opts);', // 4
+        '}', // 5
+    ].join('\n');
+    const webstorm = computeFoldingRanges(code, WEBSTORM);
+    // The signature paren group stretches through the body end — Fold All
+    // collapses the whole signature+body instead of leaving a dangling
+    // `): Promise<Response> {` line.
+    assert.ok(
+        webstorm.some(r => r.start === 0 && r.end === 5),
+        'async signature paren should stretch through the body'
+    );
+    // The body `{` keeps its own progressive fold.
+    assert.deepEqual(byStart(webstorm, 3), { start: 3, end: 5 });
+});
+
+test('a multi-line function folds to one line under Fold All', () => {
+    const code = [
+        'function compute(', // 0
+        '  a: number,', // 1
+        '  b: number,', // 2
+        '  c: number', // 3
+        '): number {', // 4
+        '  return a + b + c;', // 5
+        '}', // 6
+    ].join('\n');
+    const webstorm = computeFoldingRanges(code, WEBSTORM);
+    // The signature paren merges with the body — one fold covers lines 0-6.
+    assert.ok(
+        webstorm.some(r => r.start === 0 && r.end === 6),
+        'multi-line function signature should merge through the body'
+    );
+});
+
+test('singleLineFolds never swallows a closing line that continues the statement', () => {
+    const code = [
+        'const result = compute(', // 0
+        '  1,', // 1
+        '  2,', // 2
+        '  3', // 3
+        '); doSomething();', // 4 — the closing line continues with a statement
+    ].join('\n');
+    const webstorm = computeFoldingRanges(code, WEBSTORM);
+    assert.ok(
+        webstorm.some(r => r.start === 0 && r.end === 3),
+        'the fold must stop before the closing line'
+    );
+    assert.ok(
+        !webstorm.some(r => r.end === 4 && r.start < 4),
+        'closing line that continues the statement must not be swallowed'
+    );
 });

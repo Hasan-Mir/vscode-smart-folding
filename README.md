@@ -1,8 +1,8 @@
 # 🧠 Smart Folding — WebStorm-Style Code Folding for VS Code
 
-Bring JetBrains/WebStorm's beloved folding experience to VS Code: single-line folds, a big clickable `{...}` badge, readable comment previews, visible function params, and a cursor that always comes back to where you left it. ✨
+Bring JetBrains/WebStorm's beloved folding experience to VS Code: single-line folds, a big clickable `{...}` badge, readable comment previews, and a cursor that always comes back to where you left it. ✨
 
-> 🎹 **No keybindings are contributed by this extension.** It reacts to VS Code's **built-in** fold/unfold commands, so it works with _your_ keymap — IntelliJ IDEA Keybindings (`Ctrl+Shift+-` / `Ctrl+Shift+=`), `Alt+W`, the Command Palette, or the gutter chevrons. Nothing to configure, nothing to conflict.
+> 🎹 **No fold/unfold keybindings are contributed** — Smart Folding reacts to VS Code's **built-in** fold/unfold commands, so it works with _your_ keymap (IntelliJ IDEA Keybindings, `Alt+W`, the Command Palette, or the gutter chevrons). The only keybinding contributed is a **conditional `Ctrl+C`/`Cmd+C` override** for `smartFolding.clipboardCopy` (active only while `smartFolding.copyFoldedBlocks` is enabled), which copies whole collapsed blocks instead of broken visible rows.
 
 ---
 
@@ -16,10 +16,6 @@ A collapsed block renders as **one line** — the closing bracket is folded away
 function activate(context: vscode.ExtensionContext) {...}
 ```
 
-### 🎯 Function parameters stay visible
-
-Parameter lists `(...)` are never offered as folds, so folding a function keeps its full signature readable — exactly like WebStorm.
-
 ### 🏷️ A real `{...}` badge (clickable!)
 
 - The block's own opening `{` is visually hidden and a themed **`{...}`** badge takes its place (also `[...]` / `(...)` for arrays and groups).
@@ -28,10 +24,12 @@ Parameter lists `(...)` are never offered as folds, so folding a function keeps 
 - 🎨 Colors are theme-aware with separate **dark/light** overrides.
 - 🧲 The badge sticks right after the visible code — BEFORE end-of-line decorations from other extensions such as GitLens inline blame.
 
+> 💡 **Click-to-expand UX note:** Because the VS Code Extension API does not provide direct DOM click events for text decorations, clicking a badge is detected via editor caret movement (`onDidChangeTextEditorSelection`). If your cursor is already parked directly on the opening bracket (e.g. bracket-matching border is active), click slightly towards the middle/right of the badge or use the hover tooltip's **[Expand]** action. You can also enable `"smartFolding.clickLineToExpand": true` to expand by clicking anywhere on the collapsed line.
+
 ### 💬 Comment folding with readable previews
 
 - Multi-line block comments & JSDoc fold — and so do runs of consecutive whole-line `//` comments _(new in 1.4)_.
-- The **entire comment — `/**` header included — collapses into the gray badge\*\*, which shows the comment's first meaningful text line (WebStorm style), truncated to a configurable length:
+- The **entire comment — `/**` header included — collapses into the gray badge**, which shows the comment's first meaningful text line (WebStorm style), truncated to a configurable length:
 
 ```ts
 /** Remembers the cursor position when folding… */
@@ -59,6 +57,8 @@ After a Fold All, **Smart Unfold** opens _only_ the parent chain around your rem
 | `Smart Folding: Unfold All (Restore Cursor)`  | Unfolds everything and jumps back to your cursor          |
 | `Smart Folding: Smart Unfold (Reveal Cursor)` | Opens only the blocks containing your cursor              |
 | `Smart Folding: Smart Unfold Recursively`     | Same, but opens the chain recursively                     |
+| `Smart Folding: Copy (Whole Collapsed Blocks)`| Copies whole collapsed blocks (bound to Ctrl+C / Cmd+C)   |
+| `Smart Folding: Expand Folded Block on This Line` | Unfolds the block on the active line (badge hover action) |
 
 💡 You don't have to use these commands — the built-in `editor.foldAll` / `editor.unfoldAll` / `editor.unfold` / `editor.unfoldRecursively` (with your own keybindings) are detected automatically.
 
@@ -79,15 +79,17 @@ After a Fold All, **Smart Unfold** opens _only_ the parent chain around your rem
 | `smartFolding.ellipsisBackgroundDark` / `Light` | `""` / `#dfe1e5` | Theme-specific background overrides                                                                                                                 |
 | `smartFolding.ellipsisColorDark` / `Light`      | `""` / `#6a6f77` | Theme-specific text color overrides                                                                                                                 |
 | `smartFolding.clickToExpand`                    | `true`           | Click a collapsed line to expand it                                                                                                                 |
+| `smartFolding.clickLineToExpand`                | `false`          | Click ANYWHERE on a collapsed line (not just the `···` badge) to expand it                                                                          |
+| `smartFolding.copyFoldedBlocks`                 | `true`           | `Ctrl+C` on a collapsed line copies the WHOLE hidden block, not just the visible row                                                                |
 | `smartFolding.modifierClickExpandsRecursively`  | `true`           | Alt+click a badge to expand recursively (modifier = `editor.multiCursorModifier`)                                                                   |
 | `smartFolding.singleLineFolding`                | `true`           | Fold the closing bracket line too (WebStorm style)                                                                                                  |
-| `smartFolding.keepFunctionParamsVisible`        | `true`           | Never fold parameter lists                                                                                                                          |
 | `smartFolding.rememberCursorOnFoldAll`          | `true`           | Remember cursor + scroll on Fold All                                                                                                                |
 | `smartFolding.restoreOnAnyUnfold`               | `true`           | Restore the cursor after _any_ unfold, any shortcut                                                                                                 |
 | `smartFolding.smartUnfold`                      | `true`           | Enable smart (focus) unfolding                                                                                                                      |
-| `smartFolding.takeOverFolding`                  | `true`           | Register as the default folding range provider                                                                                                      |
-| `smartFolding.providerDelay`                    | `2000`           | Delay (ms) before re-registering the provider                                                                                                       |
+| `smartFolding.takeOverFolding`                  | `true`           | Be the sole folding provider (unified model verified against the tsserver parity suite + WebStorm single-line folds)                                |
 | `smartFolding.languages`                        | JS/TS family     | Languages the folding provider applies to                                                                                                           |
+
+> **Language coverage note (takeover):** Smart Folding's scanner does not yet safely model the language-specific multiline literals of **C, C++, C#, Java and PHP** (raw strings, verbatim/interpolated strings, text blocks, heredoc). Those languages keep **native VS Code folding** even when listed in `smartFolding.languages` — they are excluded from both the folding-provider registration and the `defaultFoldingRangeProvider` takeover until support lands.
 
 ---
 
@@ -95,7 +97,7 @@ After a Fold All, **Smart Unfold** opens _only_ the parent chain around your rem
 
 ```bash
 npm install
-npx @vscode/vsce package   # produces smart-folding-1.6.0.vsix
+npx @vscode/vsce package   # produces smart-folding-1.4.0.vsix
 ```
 
 Then in VS Code: **Extensions → ⋯ → Install from VSIX…**
@@ -105,11 +107,16 @@ Then in VS Code: **Extensions → ⋯ → Install from VSIX…**
 ## 🧪 Development
 
 ```bash
-npm run compile   # tsc -p ./
-node --test out/test/*.test.js
+npm run build              # tsc -p ./
+npm test                   # unit tests (node --test on out/test)
+npm run test:parity        # tsserver parity harness (lenient extras reporting)
+npm run test:parity:strict # strict mode: unexpected extras fail (CI)
+npm run test:integration   # real extension-host tests (needs a display / xvfb)
 ```
 
-The folding scanner and all detection logic live in `src/core/folding.ts` as pure, unit-tested functions.
+The folding scanner and all detection logic live in `src/core/folding.ts` as pure, unit-tested functions. The parity fixtures in `fixtures/parity/` are diffed against a real tsserver; intentional WebStorm divergences are recorded in `fixtures/parity/allowlist.json`.
+
+> 📖 See [TESTING.md](./TESTING.md) for the detailed testing architecture (unit, parity, and integration tiers).
 
 ---
 
