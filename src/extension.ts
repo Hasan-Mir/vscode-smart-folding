@@ -823,10 +823,13 @@ export function activate(context: vscode.ExtensionContext): void {
                 }));
                 const hidden = lineHiddenByFold(visible, prevActive.line);
                 const rs = rangesFor(editor.document);
-                
+
                 // Find last non-empty code line to safely handle trailing blank lines near EOF
                 let lastCodeLine = editor.document.lineCount - 1;
-                while (lastCodeLine > 0 && editor.document.lineAt(lastCodeLine).text.trim().length === 0) {
+                while (
+                    lastCodeLine > 0 &&
+                    editor.document.lineAt(lastCodeLine).text.trim().length === 0
+                ) {
                     lastCodeLine--;
                 }
                 const reachesEof = rs.some(
@@ -1031,12 +1034,24 @@ export function activate(context: vscode.ExtensionContext): void {
             }));
             const prev = m.lastVisible ?? [];
             m.lastVisible = cur;
-            // E-5: an unfold MERGES previously separated visible ranges (or
-            // reveals a fold-hidden gap in place); a fold or plain scroll
-            // never does. This is the state signal the probe gates on.
-            if (cur.length < prev.length || unfoldRevealedGapLines(prev, cur)) {
+
+            // E-5: an unfold reveals a fold-hidden gap in place — a
+            // fold (even a deeply nested Fold All) never does, so this is
+            // the ONLY reliable state signal the probe gates on. The former
+            // `cur.length < prev.length` disjunct assumed any drop in
+            // visible-range COUNT meant ranges had merged from an unfold,
+            // but a multi-level Fold All also drops the count: when an
+            // outer range collapses, every already-visible sliver nested
+            // inside it (from folds applied earlier in the same Fold All)
+            // disappears from the list too. That false signal armed
+            // unfoldSignal during the fold itself, so the next debounced
+            // probe mistook Fold All for a manual unfold-in-progress and
+            // ran smartUnfold, which reopened the ancestor chain of the
+            // pre-fold cursor line.
+            if (unfoldRevealedGapLines(prev, cur)) {
                 m.unfoldSignal = true;
             }
+
             if (!m.savedState) return;
             // Fold/unfold transitions fire bursts of events — debounce, then
             // probe once the folding model has settled.
@@ -1093,13 +1108,11 @@ export function activate(context: vscode.ExtensionContext): void {
     };
 
     registerProvider();
-    context.subscriptions.push(
-        {
-            dispose: () => {
-                providerRegistration?.dispose();
-            },
-        }
-    );
+    context.subscriptions.push({
+        dispose: () => {
+            providerRegistration?.dispose();
+        },
+    });
 
     // The takeover route (VS Code ≥1.73): `editor.defaultFoldingRangeProvider`
     // makes this extension the ONLY folding source for the configured
