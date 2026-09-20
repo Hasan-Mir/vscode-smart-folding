@@ -866,6 +866,7 @@ export function activate(context: vscode.ExtensionContext): void {
             // Give the folding model a moment to clamp the cursor.
             await sleep(100);
             const m = mem(editor);
+            m.unfoldSignal = false;
             // E-4: keep restore state ONLY when the fold actually clamped the
             // cursor (post-fold selection ≠ pre-fold selection). A no-op Fold
             // All previously armed the restore logic unconditionally, and a
@@ -981,41 +982,33 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!m.unfoldSignal) return;
         m.unfoldSignal = false;
 
-        autoRestoring = true;
-        try {
-            editor.selections = cloneSelections(state.selections);
-            await sleep(30);
-            const landedLine = editor.selection.active.line;
-            if (landedLine === saved.line) {
-                // The selection stuck → folds are open → the restore itself
-                // already succeeded. Consume the state IMMEDIATELY: holding it
-                // until the line scrolled into view meant every later scroll
-                // event re-probed and yanked the viewport back up (the
-                // "can't scroll down after Unfold All" jump).
-                m.savedState = undefined;
-                restoreView(editor, state.selections);
-                for (let attempt = 0; attempt < 4; attempt++) {
-                    await sleep(30);
-                    if (lineIsRendered(editor, saved.line)) break;
-                    restoreView(editor, state.selections);
-                }
-                return;
-            } else if (
-                landedLine > (state.clampedActive?.line ?? parked.line) &&
-                landedLine <= saved.line &&
-                !lineIsRendered(editor, saved.line) &&
+        const ranges = rangesFor(editor.document);
+        const folds = currentCollapsedFolds(editor, ranges);
+        const containingFold = folds.find(f => saved.line > f.header && saved.line <= f.hiddenEnd);
+
+        if (containingFold) {
+            // If the containing fold starts below the clamp line, an outer block was opened
+            // by the user and smartUnfold should finish expanding the parent chain.
+            if (
+                state.clampedActive &&
+                containingFold.header > state.clampedActive.line &&
                 c.get<boolean>('smartUnfold', true)
             ) {
-                // Clamped to a DIFFERENT, deeper fold header → the user's
-                // unfold opened the outer block → finish the parent chain.
                 await smartUnfold(editor);
-                if (m.savedState === undefined) return; // consumed on success
             }
-            // Not restorable yet — park the cursor back where it was and keep
-            // the remembered state for the next unfold.
-            editor.selections = [new vscode.Selection(parked, parked)];
-        } finally {
-            autoRestoring = false;
+            // If the fold that originally swallowed the cursor is STILL collapsed, do NOT
+            // probe or restore; doing so would trigger Monaco's revealRange and reopen the fold.
+            parkCursorOutsideBadge(editor);
+            return;
+        }
+
+        // Every fold hiding saved.line is truly open.
+        m.savedState = undefined;
+        restoreView(editor, state.selections);
+        for (let attempt = 0; attempt < 4; attempt++) {
+            await sleep(30);
+            if (lineIsRendered(editor, saved.line)) break;
+            restoreView(editor, state.selections);
         }
         // The parked position sits inside the badge's click zone — nudge the
         // cursor out so the next badge click still fires a selection event.
