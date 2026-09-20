@@ -589,7 +589,8 @@ export function activate(context: vscode.ExtensionContext): void {
                         c,
                         asHeader.hiddenEnd
                     );
-                    const threshold = hiddenStart ?? editor.document.lineAt(p.line).text.length;
+                    const threshold =
+                        hiddenStart ?? Math.max(0, editor.document.lineAt(p.line).text.length - 1);
                     return p.character >= threshold ? p.line : undefined;
                 }
                 // The gap itself tells us the header — no range guessing.
@@ -701,7 +702,8 @@ export function activate(context: vscode.ExtensionContext): void {
         const fold = folds.find(f => f.header === pos.line);
         if (!fold) return;
         const { hiddenStart } = foldBadge(editor, pos.line, ranges, cfg(), fold.hiddenEnd);
-        const threshold = hiddenStart ?? editor.document.lineAt(pos.line).text.length;
+        const threshold =
+            hiddenStart ?? Math.max(0, editor.document.lineAt(pos.line).text.length - 1);
         if (pos.character < threshold) return;
         // NEVER park on a different line: the restore probe compares the
         // landed line against the parked line, and a cross-line park made it
